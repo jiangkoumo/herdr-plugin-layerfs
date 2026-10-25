@@ -7,6 +7,15 @@ indented under the repo in the sidebar, exactly like `herdr worktree`, and `git 
 
 [中文说明](#中文说明)
 
+## Changes in 0.3.0
+
+- `merge [with] [--name <new-branch>] [--open]` saves the current workspace and merges into a new branch.
+- Import adds default `.lww` rules to the imported copy; `LFS_NO_DEFAULT_LWW=1` disables generation.
+- `drop` retains the workspace record and Git registration when unmount fails. It reports the cause and exits
+  nonzero. After releasing the directory, run it again from another pane with the original `HERDR_WORKSPACE_ID`.
+  Once unmounted, completed cleanup steps are saved so Git/Herdr cleanup failures can be resumed. Git branches
+  and LayerFS history are kept. Pending cleanup is not automatically remounted on startup.
+
 ## What it does
 
 | Action | |
@@ -16,7 +25,7 @@ indented under the repo in the sidebar, exactly like `herdr worktree`, and `git 
 | **LayerFS: new named branch** (pane) | Same, asks for the name. |
 | **LayerFS: commit this workspace** | Saves the workspace on its LayerFS branch. |
 | **LayerFS: merge with parent** | Saves this workspace, then merges with its recorded parent (or `main`) into a new branch. Both inputs are kept. |
-| **LayerFS: discard this workspace** | Closes it and unmounts without saving. The git branch is kept. |
+| **LayerFS: discard this workspace** | Unmounts without saving, removes its Git worktree registration, then closes it. The git branch is kept. Failures retain the record for cleanup. |
 | **LayerFS: reopen last closed branch** | Mounts a saved branch again. |
 | **LayerFS: status** (pane) | Projects, open and closed branches. |
 
@@ -149,6 +158,11 @@ node "$LFS"/lfs.mjs list            # projects and branches
 把 LayerFS 分支变成 Herdr 工作区：开一个新分支约 2 秒、几乎不占磁盘。native 模式下每个分支同时是源仓库的
 git worktree，所以会像 `herdr worktree` 一样缩进挂在仓库工作区下面（树状），里面照常 `git commit`、`git push`。
 关闭工作区自动保存并卸载；herdr 重启或电脑重启后，`startup` 钩子会重新挂载并恢复工作区。
+
+0.3.0 新增 merge 命令和导入副本的默认 `.lww`，并修复 drop 失败后记录丢失的问题。
+drop 先卸载、再清理 Git worktree 注册和 Herdr 工作区，全部成功后才删记录，保留 git 分支与 LayerFS 历史。
+遇到 Busy 时先关闭占用挂载目录的进程、让 pane 离开该目录，然后在其他 pane 设置原 `HERDR_WORKSPACE_ID` 再执行 drop。
+后续清理失败会保留已完成步骤，下一次 drop 继续清理；startup 不会重新挂载清理中的记录。
 
 native 模式需要 LayerFS 的 macOS 原生支持（PR #427，尚未发布）；docker 模式对应上游 main（Linux），已在 Debian 13 上验证。
 

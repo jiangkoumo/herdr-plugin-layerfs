@@ -76,10 +76,9 @@ const save = () => { mkdirSync(stDir, { recursive: true }); writeFileSync(stFile
 function notify(msg) { spawnSync(herdr, ["notification", "show", "LayerFS", "--body", msg, "--sound", "none"], { stdio: "ignore" }); console.log(msg); }
 function fail(msg) { console.error(`layerfs: ${msg}`); notify(`error: ${msg}`); process.exit(1); }
 const run = (bin, args, opts = {}) => spawnSync(bin, args, { encoding: "utf8", ...opts });
-const git = (dir, ...a) => { const r = run("git", ["-C", dir, ...a]); if (r.status) throw Object.assign(new Error(`git ${a.join(" ")}: ${r.stderr.trim()}`), { code: "Git" }); return r.stdout.trim(); };
-const H = (...a) => { const r = run(herdr, a); if (r.status) throw Object.assign(new Error(`herdr ${a.join(" ")}: ${(r.stderr || r.stdout).trim()}`), { code: "Herdr" }); try { return JSON.parse(r.stdout); } catch { return r.stdout; } };
+const git = (dir, ...a) => { const r = run("git", ["-C", dir, ...a]); if (r.error || r.status !== 0) throw Object.assign(new Error(`git ${a.join(" ")}: ${r.error?.message || r.stderr.trim()}`), { code: "Git" }); return r.stdout.trim(); };
+const H = (...a) => { const r = run(herdr, a); if (r.error || r.status !== 0) throw Object.assign(new Error(`herdr ${a.join(" ")}: ${r.error?.message || (r.stderr || r.stdout).trim()}`), { code: "Herdr" }); try { return JSON.parse(r.stdout); } catch { return r.stdout; } };
 const herdrWorkspaces = () => { try { return H("workspace", "list").result.workspaces.map((w) => w.workspace_id); } catch { return []; } };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // focused directory / workspace from Herdr's context
 const ctx = (() => { try { return JSON.parse(process.env.HERDR_PLUGIN_CONTEXT_JSON || "{}"); } catch { return {}; } })();
@@ -108,7 +107,8 @@ function adminOf(p, gitBranch) {                                // <repo>/.git/w
   const root = join(git(p.source, "rev-parse", "--path-format=absolute", "--git-common-dir"), "worktrees");
   if (!existsSync(root)) return null;
   for (const id of readdirSync(root)) {
-    try { if (readFileSync(join(root, id, "HEAD"), "utf8").trim() === `ref: refs/heads/${gitBranch}`) return join(root, id); } catch {}
+    try { if (readFileSync(join(root, id, "HEAD"), "utf8").trim() === `ref: refs/heads/${gitBranch}`) return join(root, id); }
+    catch (err) { if (err.code !== "ENOENT") throw err; }
   }
   return null;
 }
@@ -136,8 +136,14 @@ function linkWorktree(e, p) {
   git(e.path, "reset", "-q");                                    // index from HEAD; the files are already there
 }
 function unlinkWorktree(e, p) {
-  const admin = (() => { try { return readFileSync(join(e.path, ".git"), "utf8").match(/^gitdir: (.*)$/m)?.[1]; } catch { return adminOf(p, e.gitBranch); } })();
-  if (admin && admin.includes("/worktrees/")) rmSync(admin, { recursive: true, force: true });
+  // The mount is already gone: locate only this branch's registration in the source repo.
+  // Do not use git worktree remove: it can delete the mount directory or another live view.
+  const admin = adminOf(p, e.gitBranch);
+  if (admin) {
+    if (resolve(readFileSync(join(admin, "gitdir"), "utf8").trim()) !== join(e.path, ".git"))
+      throw new Error(`Git worktree ${e.gitBranch} points elsewhere; inspect ${admin} before cleanup`);
+    rmSync(admin, { recursive: true, force: true });
+  }
 }
 
 // --- open the Herdr workspace for a mounted Workspace -------------------------------------------
@@ -175,7 +181,8 @@ async function dockerMounted(lf, e) {                           // the Sandbox s
 function leaveShells(e, p) {
   if (!p.container) return;
   const script = `for d in /proc/[0-9]*; do c=$(readlink "$d/cwd" 2>/dev/null) || continue; case "$c" in "$1"|"$1"/*) kill -HUP "\${d#/proc/}" 2>/dev/null;; esac; done; sleep 0.3`;
-  run("docker", ["exec", p.container, "sh", "-c", script, "sh", e.path]);
+  const r = run("docker", ["exec", p.container, "sh", "-c", script, "sh", e.path]);
+  if (r.error || r.status !== 0) throw new Error(`cannot stop workspace shells: ${r.error?.message || r.stderr.trim()}`);
 }
 
 const entryHere = () => st.workspaces[wsId];
@@ -285,19 +292,36 @@ try {
     if (cmd === "on-close") id = findKey(JSON.parse(process.env.HERDR_PLUGIN_EVENT_JSON || "{}"), "workspace_id");
     const e = st.workspaces[id];
     if (!e) { if (cmd === "on-close") process.exit(0); fail("this workspace is not a LayerFS branch"); }
+    if (cmd === "on-close" && e.cleanup) process.exit(0); // drop's close hook must not commit or unmount again
     const p = st.projects[e.project];
-    lf = await LayerFS.open(e.project);
     const ws = { sandbox: e.sandbox, path: e.path };
-    if (cmd === "on-close") await lf.workspace.commit(ws, `herdr: ${e.branch} (closed)`);
-    delete st.workspaces[id]; save();                             // first: our own workspace.closed hook then ignores it
-    if (cmd === "drop") { if (e.gitBranch) unlinkWorktree(e, p); try { H("workspace", "close", id); } catch {} }
-    if (!native) leaveShells(e, p);
-    for (let i = 0; ; i++) {                                      // the workspace's shells may still sit in the mount
-      try { await lf.workspace.unmount(ws, cmd === "drop"); break; }
-      catch (err) { if (!["Busy", "NoSuchWorkspace"].includes(err.code) || i >= 20) throw err; if (err.code === "NoSuchWorkspace") break; await sleep(500); }
+    try {
+      if (!e.cleanup?.unmounted) {
+        lf = await LayerFS.open(e.project);
+        if (cmd === "on-close") await lf.workspace.commit(ws, `herdr: ${e.branch} (closed)`);
+        if (!native) leaveShells(e, p);
+        await lf.workspace.unmount(ws, cmd === "drop"); // one attempt; Busy/uncertain failure retains the record
+        e.cleanup = { unmounted: true }; save();
+      }
+      if (cmd === "drop") {
+        if (!e.cleanup.unlinked) {
+          if (e.gitBranch) unlinkWorktree(e, p); // Git branches and LayerFS history are always kept
+          e.cleanup.unlinked = true; save();
+        }
+        if (!e.cleanup.closed) {
+          H("workspace", "close", id); // do not hide UI cleanup failures
+          e.cleanup.closed = true; save();
+        }
+      } else {
+        p.closed ||= {}; p.closed[e.branch] = { parent: e.parent || "main", gitBranch: e.gitBranch, base: e.base };
+      }
+      delete st.workspaces[id];
+      try { save(); } catch (err) { st.workspaces[id] = e; throw err; }
+    } catch (err) {
+      console.error(`Workspace record retained for ${id}. Close panes/processes using ${e.path}, leave that directory, then run drop again from another pane with HERDR_WORKSPACE_ID=${id}. If cleanup already unmounted it, drop resumes the remaining Git/Herdr cleanup. Inspect uncertain errors before continuing.`);
+      throw err;
     }
     notify(cmd === "drop" ? `discarded ${e.branch}${e.gitBranch ? ` (git branch ${e.gitBranch} kept)` : ""}` : `saved ${e.branch}; reopen it with "LayerFS: reopen branch"`);
-    if (cmd === "on-close") { p.closed ||= {}; p.closed[e.branch] = { parent: e.parent || "main", gitBranch: e.gitBranch, base: e.base }; save(); }
   } else if (cmd === "reopen") {                                 // mount a saved branch again (arg = branch, default newest closed)
     const project = projectHere() || fail(`no LayerFS project for ${cwd}`);
     const p = st.projects[project]; const names = Object.keys(p.closed || {});
@@ -312,6 +336,7 @@ try {
   } else if (cmd === "startup") {                                // after a reboot / server restart: remount and reopen
     const live = herdrWorkspaces(); let n = 0;
     for (const [id, e] of Object.entries(st.workspaces)) {
+      if (e.cleanup) { console.error(`cleanup pending for ${id} (${e.branch}); run drop with HERDR_WORKSPACE_ID=${id} to finish`); continue; }
       const p = st.projects[e.project];
       try {
         lf = await LayerFS.open(e.project);
