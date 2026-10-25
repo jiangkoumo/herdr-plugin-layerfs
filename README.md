@@ -121,7 +121,10 @@ description = "LayerFS: new branch workspace"
 
 `herdr plugin action invoke` acts on the workspace **focused in the Herdr UI**, not on the pane that runs the command
 (checked on Herdr 0.9.5). An agent should run the plugin script directly instead: it then uses its own pane's
-workspace (`HERDR_WORKSPACE_ID`) and current directory.
+workspace (`HERDR_WORKSPACE_ID`) and current directory. Outside Herdr (SSH/scripts), native mode falls back to
+the real current directory, including subdirectories and symlinks, to find the mounted branch in the same plugin
+state. Run inside that branch, set `LFS_CWD` to its path, or explicitly set its `HERDR_WORKSPACE_ID` from
+`lfs.mjs list`; share the same `LFS_STATE_DIR`. An existing Herdr ID always takes precedence.
 
 ```sh
 LFS=$(herdr plugin list --plugin layerfs --json | jq -r '.result.plugins[0].plugin_root')

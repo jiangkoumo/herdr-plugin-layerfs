@@ -4,7 +4,7 @@
 //     source repo, so Herdr groups it under the repo's workspace (sidebar tree) and git runs on the host as usual.
 //   docker mode (default, upstream main on Linux): the Workspace lives inside the Sandbox container; the new
 //     Herdr workspace's root pane enters it with `docker exec`.
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, rmSync, mkdtempSync, readdirSync, cpSync, copyFileSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, rmSync, mkdtempSync, readdirSync, cpSync, copyFileSync, realpathSync } from "node:fs";
 import { join, basename, dirname, isAbsolute, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -83,7 +83,7 @@ const herdrWorkspaces = () => { try { return H("workspace", "list").result.works
 // focused directory / workspace from Herdr's context
 const ctx = (() => { try { return JSON.parse(process.env.HERDR_PLUGIN_CONTEXT_JSON || "{}"); } catch { return {}; } })();
 const findKey = (o, k) => { if (!o || typeof o !== "object") return; if (typeof o[k] === "string") return o[k]; for (const v of Object.values(o)) { const r = findKey(v, k); if (r) return r; } };
-const wsId = process.env.HERDR_WORKSPACE_ID || findKey(ctx, "workspace_id");
+let wsId = process.env.HERDR_WORKSPACE_ID || findKey(ctx, "workspace_id");
 const cwd = resolve(process.env.LFS_CWD || findKey(ctx, "cwd") || process.cwd());
 
 const { LayerFS } = await import(join(process.env.LAYERFS_API, "agent/sdk/src/index.js"));
@@ -185,6 +185,23 @@ function leaveShells(e, p) {
   if (r.error || r.status !== 0) throw new Error(`cannot stop workspace shells: ${r.error?.message || r.stderr.trim()}`);
 }
 
+// SSH/scripts have no Herdr ID. Resolve only local mounted paths, never container paths
+// or pending cleanup. Preserve explicit Herdr context even if its ID is unknown.
+if (!wsId && native && ["fork", "merge", "commit", "drop", "reopen"].includes(cmd)) {
+  const canonical = (path) => {
+    try { return realpathSync(path); }
+    catch (err) { if (["ENOENT", "ENOTDIR"].includes(err.code)) return null; throw err; }
+  };
+  const here = canonical(cwd);
+  const hits = here ? Object.entries(st.workspaces).filter(([, e]) => {
+    if (e.cleanup) return false;
+    const root = canonical(e.path);
+    return root && (here === root || here.startsWith(`${root}/`));
+  }) : [];
+  if (hits.length > 1) fail(`multiple LayerFS workspaces match ${cwd}; set HERDR_WORKSPACE_ID to the intended entry from lfs.mjs list`);
+  wsId = hits[0]?.[0];
+}
+const noBranch = () => fail(`no registered LayerFS branch for ${cwd}; run inside a mounted branch (or its subdirectory), set LFS_CWD to that path, or set HERDR_WORKSPACE_ID to its entry from lfs.mjs list; use the same LFS_STATE_DIR`);
 const entryHere = () => st.workspaces[wsId];
 const projectHere = () => entryHere()?.project
   || Object.entries(st.projects).find(([, p]) => p.source === cwd || p.source === gitTop(cwd))?.[0];
@@ -238,7 +255,7 @@ try {
     const id = await opened(lf, e, p, true);
     notify(`${branch} ready (${id})`);
   } else if (cmd === "merge") {
-    const e = entryHere() || fail("this workspace is not a LayerFS branch");
+    const e = entryHere() || noBranch();
     let withBranch, requestedName, open = false;
     const args = process.argv.slice(3);
     for (let i = 0; i < args.length; i++) {
@@ -283,7 +300,7 @@ try {
       notify(`${name} ready (${id})`);
     }
   } else if (cmd === "commit") {
-    const e = entryHere() || fail("this workspace is not a LayerFS branch");
+    const e = entryHere() || noBranch();
     lf = await LayerFS.open(e.project);
     await lf.workspace.commit({ sandbox: e.sandbox, path: e.path }, arg || `herdr: ${e.branch}`);
     notify(`committed ${e.branch}`);
@@ -291,7 +308,7 @@ try {
     let id = wsId;
     if (cmd === "on-close") id = findKey(JSON.parse(process.env.HERDR_PLUGIN_EVENT_JSON || "{}"), "workspace_id");
     const e = st.workspaces[id];
-    if (!e) { if (cmd === "on-close") process.exit(0); fail("this workspace is not a LayerFS branch"); }
+    if (!e) { if (cmd === "on-close") process.exit(0); noBranch(); }
     if (cmd === "on-close" && e.cleanup) process.exit(0); // drop's close hook must not commit or unmount again
     const p = st.projects[e.project];
     const ws = { sandbox: e.sandbox, path: e.path };
