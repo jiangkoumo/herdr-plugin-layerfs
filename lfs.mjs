@@ -12,7 +12,21 @@ const herdr = process.env.HERDR_BIN_PATH || "herdr";
 const [cmd, arg] = process.argv.slice(2);
 const quietHook = cmd === "on-close" || cmd === "startup";
 
-const cfgFile = join(process.env.HERDR_PLUGIN_CONFIG_DIR || ".", "config.env");
+// Run from a shell (an agent's pane) instead of by Herdr: `node <plugin_root>/lfs.mjs fork [name]`. Herdr's own CLI
+// invoke acts on the workspace focused in the UI, not the caller's, so a direct run uses the pane's HERDR_WORKSPACE_ID
+// and cwd, and finds the config dir and state dir that Herdr-launched runs use.
+const direct = !process.env.HERDR_PLUGIN_ID;
+if (direct && !process.env.HERDR_PLUGIN_CONFIG_DIR) {
+  const r = spawnSync(herdr, ["plugin", "config-dir", "layerfs"], { encoding: "utf8" });
+  if (!r.status && r.stdout.trim()) process.env.HERDR_PLUGIN_CONFIG_DIR = r.stdout.trim();
+}
+const cfgDir = process.env.HERDR_PLUGIN_CONFIG_DIR || ".";
+const stPtr = join(cfgDir, ".state-dir");
+if (direct && !process.env.HERDR_PLUGIN_STATE_DIR && existsSync(stPtr)) process.env.HERDR_PLUGIN_STATE_DIR = readFileSync(stPtr, "utf8").trim();
+if (!direct && process.env.HERDR_PLUGIN_STATE_DIR && process.env.HERDR_PLUGIN_CONFIG_DIR) {
+  try { if (!existsSync(stPtr) || readFileSync(stPtr, "utf8").trim() !== process.env.HERDR_PLUGIN_STATE_DIR) writeFileSync(stPtr, process.env.HERDR_PLUGIN_STATE_DIR + "\n"); } catch {}
+}
+const cfgFile = join(cfgDir, "config.env");
 if (existsSync(cfgFile)) for (const l of readFileSync(cfgFile, "utf8").split("\n")) {
   const m = l.match(/^\s*([A-Z_]+)=(.*)$/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim().replace(/^~(?=\/)/, process.env.HOME);
 }
@@ -28,6 +42,7 @@ if (process.env.LAYERFS_STORE_PATH) mkdirSync(dirname(dirname(process.env.LAYERF
 
 // state can be pinned with LFS_STATE_DIR so actions, hooks and every Herdr session share it
 const stDir = process.env.LFS_STATE_DIR || process.env.HERDR_PLUGIN_STATE_DIR || ".";
+if (direct && !process.env.LFS_STATE_DIR && !process.env.HERDR_PLUGIN_STATE_DIR) fail("run any LayerFS action from Herdr once first (it records where the plugin keeps its state), or set LFS_STATE_DIR in config.env");
 const stFile = join(stDir, "state.json");
 const st = existsSync(stFile) ? JSON.parse(readFileSync(stFile, "utf8")) : { projects: {}, workspaces: {} };
 const save = () => { mkdirSync(stDir, { recursive: true }); writeFileSync(stFile, JSON.stringify(st, null, 2)); };
@@ -125,6 +140,18 @@ async function opened(lf, e, p, fresh) {
   }
 }
 
+async function dockerMounted(lf, e) {                           // the Sandbox still runs and still holds this Workspace
+  try { return ((await lf.sandbox.list_workspaces(e.sandbox)).items ?? []).some((w) => w.path === e.path); } catch { return false; }
+}
+
+// docker mode: closing a pane ends the `docker exec` client but not the shell it started in the container,
+// which would keep the Workspace busy; hang up every process whose cwd is inside it
+function leaveShells(e, p) {
+  if (!p.container) return;
+  const script = `for d in /proc/[0-9]*; do c=$(readlink "$d/cwd" 2>/dev/null) || continue; case "$c" in "$1"|"$1"/*) kill -HUP "\${d#/proc/}" 2>/dev/null;; esac; done; sleep 0.3`;
+  run("docker", ["exec", p.container, "sh", "-c", script, "sh", e.path]);
+}
+
 const entryHere = () => st.workspaces[wsId];
 const projectHere = () => entryHere()?.project
   || Object.entries(st.projects).find(([, p]) => p.source === cwd || p.source === gitTop(cwd))?.[0];
@@ -178,12 +205,13 @@ try {
     lf = await LayerFS.open(e.project);
     const ws = { sandbox: e.sandbox, path: e.path };
     if (cmd === "on-close") await lf.workspace.commit(ws, `herdr: ${e.branch} (closed)`);
+    delete st.workspaces[id]; save();                             // first: our own workspace.closed hook then ignores it
     if (cmd === "drop") { if (e.gitBranch) unlinkWorktree(e, p); try { H("workspace", "close", id); } catch {} }
+    if (!native) leaveShells(e, p);
     for (let i = 0; ; i++) {                                      // the workspace's shells may still sit in the mount
       try { await lf.workspace.unmount(ws, cmd === "drop"); break; }
       catch (err) { if (!["Busy", "NoSuchWorkspace"].includes(err.code) || i >= 20) throw err; if (err.code === "NoSuchWorkspace") break; await sleep(500); }
     }
-    delete st.workspaces[id]; save();
     notify(cmd === "drop" ? `discarded ${e.branch}${e.gitBranch ? ` (git branch ${e.gitBranch} kept)` : ""}` : `saved ${e.branch}; reopen it with "LayerFS: reopen branch"`);
     if (cmd === "on-close") { p.closed ||= {}; p.closed[e.branch] = { gitBranch: e.gitBranch, base: e.base }; save(); }
   } else if (cmd === "reopen") {                                 // mount a saved branch again (arg = branch, default newest closed)
@@ -202,18 +230,19 @@ try {
     for (const [id, e] of Object.entries(st.workspaces)) {
       const p = st.projects[e.project];
       try {
-        const mounted = native ? isMounted(e.path) : false;
-        if (mounted && live.includes(id)) continue;               // nothing lost (server restart with mounts alive)
         lf = await LayerFS.open(e.project);
+        const mounted = native ? isMounted(e.path) : await dockerMounted(lf, e);
+        if (native && mounted && live.includes(id)) { await lf.close?.(); lf = null; continue; } // nothing lost
+        // docker mode: the pane's `docker exec` ended with the server, so the workspace is reopened either way
         if (!mounted) {
-          if (!native) { try { await lf.workspace.unmount({ sandbox: e.sandbox, path: e.path }); } catch {} }
           const sb = await sandboxFor(lf, e.project);
           const w = await lf.workspace.mount(sb, e.branch);
           Object.assign(e, { sandbox: sb, path: w.path });
           if (e.gitBranch) linkWorktree(e, p);
         }
+        delete st.workspaces[id]; save();                         // before the close, so on-close leaves the mount alone
         if (live.includes(id)) { try { H("workspace", "close", id); } catch {} } // restored with a dead cwd
-        delete st.workspaces[id];
+        if (!native && mounted) leaveShells(e, p);
         st.workspaces[openHerdr(e, p)] = e; save(); n++;
         await lf.close?.(); lf = null;
       } catch (err) { console.error(`restore ${e.branch}: ${err.code ?? ""} ${err.message}`); }
