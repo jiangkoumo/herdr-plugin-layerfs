@@ -56,11 +56,22 @@ Measured on a MacBook Air M2 (macOS 27.2), a 607 MB repo (483 MB of it `.git`), 
 
 ## Install
 
-1. Build LayerFS (see its README): `npm --prefix api install && npm --prefix api run build:native`, plus the daemon
-   for native mode. You need Node 22+.
-2. `herdr plugin install jiangkoumo/herdr-plugin-layerfs`
-3. `cp config.env.example "$(herdr plugin config-dir layerfs)/config.env"` and edit the paths.
-4. In a repo's workspace, run **LayerFS: import this repo**, then **LayerFS: new branch workspace**.
+Docker mode (Linux, LayerFS `main`; tested at the commit in [`layerfs.json`](layerfs.json)). You need Node 22+, Rust
+1.85.1, Docker and Herdr 0.9+.
+
+1. Clone LayerFS at that commit and build it:
+   `cargo +1.85.1 build --manifest-path core/Cargo.toml --release --locked -p layerfs-daemon`, then
+   `npm --prefix api install && npm --prefix api run build:native`.
+2. A runtime image with git and a shell, and a volume:
+   `printf 'FROM node:22-trixie\nRUN apt-get update && apt-get install -y --no-install-recommends git procps\n' | docker build -t layerfs-rt:herdr -`,
+   then `docker volume create layerfs-herdr`.
+3. `herdr plugin install jiangkoumo/herdr-plugin-layerfs`
+4. `cp config.env.example "$(herdr plugin config-dir layerfs)/config.env"`, then set the paths and
+   `LAYERFS_IMAGE=$(docker image inspect -f '{{.Id}}' layerfs-rt:herdr)`.
+5. In a repo's workspace, run **LayerFS: import this repo**, then **LayerFS: new branch workspace**.
+
+Native mode (macOS): build LayerFS from [PR #427](https://github.com/Ephemeral-AI-Lab/layerfs/pull/427) instead, and use
+the native block of `config.env.example`.
 
 See [Commands](#commands) for the CLI, key bindings and use from agents.
 
@@ -156,6 +167,9 @@ node "$LFS"/lfs.mjs list            # projects and branches
 - Names: `a-z`, `0-9`, `-`.
 
 ## Limits
+
+- Docker mode reads the Store inside the Docker volume (`LAYERFS_STORE_PATH`), so Herdr must run as a user that can
+  read `/var/lib/docker/volumes` (root on a default install). Tested that way.
 
 - Edits a branch has not saved (commit action, or closing the workspace) are lost if the machine reboots. Git commits
   are never lost: they live in your repo's `.git`.
