@@ -42,7 +42,7 @@ Measured on a MacBook Air M2 (macOS 27.2), a 607 MB repo (483 MB of it `.git`), 
   (not in a release yet). Tested on macOS.
 - **docker** (default, upstream `main`, Linux): the branch lives inside the LayerFS Sandbox container; the new
   workspace's first pane enters it with `docker exec`. No sidebar tree in this mode (the folder is not on the host).
-  **Experimental, not yet verified end to end.**
+  Verified on Linux (Debian 13, Docker 29, Herdr 0.9.5): import, fork, server restart and reboot-style restore, close/save, reopen, discard.
 
 ## Install
 
@@ -52,7 +52,54 @@ Measured on a MacBook Air M2 (macOS 27.2), a 607 MB repo (483 MB of it `.git`), 
 3. `cp config.env.example "$(herdr plugin config-dir layerfs)/config.env"` and edit the paths.
 4. In a repo's workspace, run **LayerFS: import this repo**, then **LayerFS: new branch workspace**.
 
-Bind actions to keys in Herdr's config if you use them often.
+See [Commands](#commands) for the CLI, key bindings and use from agents.
+
+## Commands
+
+There is no `herdr layerfs` subcommand. Herdr plugins are run in three ways:
+
+| From | How |
+|---|---|
+| Keyboard | bind an action in Herdr's config (below) |
+| Herdr CLI | `herdr plugin action invoke layerfs.<action>`, or `herdr plugin pane open --plugin layerfs --entrypoint fork-named` / `status` |
+| A shell or an agent | `node "$LFS"/lfs.mjs <command> [name]` (see below) |
+
+Actions: `layerfs.init`, `layerfs.fork`, `layerfs.commit`, `layerfs.reopen`, `layerfs.drop`.
+
+```toml
+# Herdr config
+[[keys.command]]
+key = "prefix+L"
+type = "plugin_action"
+command = "layerfs.fork"
+description = "LayerFS: new branch workspace"
+```
+
+### For agents (and scripts)
+
+`herdr plugin action invoke` acts on the workspace **focused in the Herdr UI**, not on the pane that runs the command
+(checked on Herdr 0.9.5). An agent should run the plugin script directly instead: it then uses its own pane's
+workspace (`HERDR_WORKSPACE_ID`) and current directory.
+
+```sh
+LFS=$(herdr plugin list --plugin layerfs --json | jq -r '.result.plugins[0].plugin_root')
+
+node "$LFS"/lfs.mjs init            # once per repo, from the repo's workspace: import HEAD
+node "$LFS"/lfs.mjs fork fix-login  # new branch workspace lfs:fix-login on git branch lfs/fix-login (name optional)
+node "$LFS"/lfs.mjs commit          # from inside a branch workspace: save it
+node "$LFS"/lfs.mjs reopen [name]   # mount a saved branch again (default: newest closed)
+node "$LFS"/lfs.mjs drop            # from inside a branch workspace: discard it (git branch kept)
+node "$LFS"/lfs.mjs list            # projects and branches
+```
+
+- Run `fork` from the source repo's workspace for a fresh branch, or from a branch workspace to fork that branch
+  (it is saved first).
+- The new workspace opens in Herdr; in native mode its path is a normal folder (the repo's linked git worktree), so
+  the agent can `cd` there or start another agent in it with `herdr`.
+- Run any LayerFS action from Herdr once after installing: it records where the plugin keeps its state, so direct
+  runs share it. Or set `LFS_STATE_DIR` in `config.env`.
+- Docker mode: run these on the host, not inside a branch's container shell (it has no `node`/`herdr`).
+- Names: `a-z`, `0-9`, `-`.
 
 ## Limits
 
@@ -68,7 +115,20 @@ Bind actions to keys in Herdr's config if you use them often.
 git worktree，所以会像 `herdr worktree` 一样缩进挂在仓库工作区下面（树状），里面照常 `git commit`、`git push`。
 关闭工作区自动保存并卸载；herdr 重启或电脑重启后，`startup` 钩子会重新挂载并恢复工作区。
 
-native 模式需要 LayerFS 的 macOS 原生支持（PR #427，尚未发布）；docker 模式对应上游 main（Linux），目前为实验性。
+native 模式需要 LayerFS 的 macOS 原生支持（PR #427，尚未发布）；docker 模式对应上游 main（Linux），已在 Debian 13 上验证。
+
+命令：没有 `herdr layerfs` 这个子命令。人用快捷键或 `herdr plugin action invoke layerfs.fork`；
+**agent 请直接跑脚本**（`herdr plugin action invoke` 作用于 UI 当前聚焦的工作区，不是 agent 自己所在的那个）：
+
+```sh
+LFS=$(herdr plugin list --plugin layerfs --json | jq -r '.result.plugins[0].plugin_root')
+node "$LFS"/lfs.mjs init            # 每个仓库一次，在仓库工作区里跑
+node "$LFS"/lfs.mjs fork 名字        # 开新分支工作区（名字可省，只能 a-z0-9-）
+node "$LFS"/lfs.mjs commit | drop   # 在分支工作区里：保存 / 丢弃
+node "$LFS"/lfs.mjs reopen [名字] | list
+```
+
+装好后先在 Herdr 里随便跑一次 LayerFS 动作（记录状态目录），之后 agent 直接跑的脚本才能共用状态。
 
 ## License
 
