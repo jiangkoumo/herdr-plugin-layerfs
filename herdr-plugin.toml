@@ -1,0 +1,62 @@
+id = "layerfs"
+name = "LayerFS"
+version = "0.2.0"
+min_herdr_version = "0.9.0"
+description = "Copy-on-write LayerFS branches as Herdr workspaces: fork a repo in ~0.2 s with no per-branch disk copy, grouped under the repo like worktrees, restored after restart."
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "init"
+title = "LayerFS: import this repo"
+description = "Snapshot the focused repo (HEAD) into a LayerFS project"
+contexts = ["pane", "tab", "workspace"]
+command = ["node", "lfs.mjs", "init"]
+
+[[actions]]
+id = "fork"
+title = "LayerFS: new branch workspace"
+description = "Fork the project, or the focused LayerFS branch, and open it as a workspace"
+contexts = ["pane", "tab", "workspace"]
+command = ["node", "lfs.mjs", "fork"]
+
+[[actions]]
+id = "commit"
+title = "LayerFS: commit this workspace"
+contexts = ["pane", "tab", "workspace"]
+command = ["node", "lfs.mjs", "commit"]
+
+[[actions]]
+id = "reopen"
+title = "LayerFS: reopen last closed branch"
+contexts = ["pane", "tab", "workspace"]
+command = ["node", "lfs.mjs", "reopen"]
+
+[[actions]]
+id = "drop"
+title = "LayerFS: discard this workspace"
+description = "Unmount without saving and close the workspace"
+contexts = ["pane", "tab", "workspace"]
+command = ["node", "lfs.mjs", "drop"]
+
+[[panes]]
+id = "fork-named"
+title = "LayerFS: new named branch"
+placement = "popup"
+width = 60
+height = 8
+command = ["sh", "fork-named.sh"]
+
+[[panes]]
+id = "status"
+title = "LayerFS: status"
+placement = "popup"
+width = "80%"
+height = "60%"
+command = ["sh", "-c", "node lfs.mjs list; echo; printf 'press enter'; read _"]
+
+[[events]]
+on = "workspace.closed"
+command = ["node", "lfs.mjs", "on-close"]
+
+[[startup]]
+command = ["node", "lfs.mjs", "startup"]
