@@ -4,12 +4,38 @@
 //     source repo, so Herdr groups it under the repo's workspace (sidebar tree) and git runs on the host as usual.
 //   docker mode (default, upstream main on Linux): the Workspace lives inside the Sandbox container; the new
 //     Herdr workspace's root pane enters it with `docker exec`.
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, rmSync, mkdtempSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, rmSync, mkdtempSync, readdirSync, cpSync, copyFileSync, realpathSync } from "node:fs";
 import { join, basename, dirname, isAbsolute, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const herdr = process.env.HERDR_BIN_PATH || "herdr";
 const [cmd, arg] = process.argv.slice(2);
+const DEFAULT_LWW = `# Generated files keep the newer version whole during LayerFS merges.
+%include .gitignore
+package-lock.json
+npm-shrinkwrap.json
+pnpm-lock.yaml
+yarn.lock
+Cargo.lock
+bun.lock
+bun.lockb
+uv.lock
+poetry.lock
+Pipfile.lock
+Gemfile.lock
+composer.lock
+*.log
+node_modules/
+dist/
+build/
+target/
+coverage/
+.cache/
+.pytest_cache/
+__pycache__/
+.next/
+.turbo/
+`;
 const quietHook = cmd === "on-close" || cmd === "startup";
 
 // Run from a shell (an agent's pane) instead of by Herdr: `node <plugin_root>/lfs.mjs fork [name]`. Herdr's own CLI
@@ -50,15 +76,14 @@ const save = () => { mkdirSync(stDir, { recursive: true }); writeFileSync(stFile
 function notify(msg) { spawnSync(herdr, ["notification", "show", "LayerFS", "--body", msg, "--sound", "none"], { stdio: "ignore" }); console.log(msg); }
 function fail(msg) { console.error(`layerfs: ${msg}`); notify(`error: ${msg}`); process.exit(1); }
 const run = (bin, args, opts = {}) => spawnSync(bin, args, { encoding: "utf8", ...opts });
-const git = (dir, ...a) => { const r = run("git", ["-C", dir, ...a]); if (r.status) throw Object.assign(new Error(`git ${a.join(" ")}: ${r.stderr.trim()}`), { code: "Git" }); return r.stdout.trim(); };
-const H = (...a) => { const r = run(herdr, a); if (r.status) throw Object.assign(new Error(`herdr ${a.join(" ")}: ${(r.stderr || r.stdout).trim()}`), { code: "Herdr" }); try { return JSON.parse(r.stdout); } catch { return r.stdout; } };
+const git = (dir, ...a) => { const r = run("git", ["-C", dir, ...a]); if (r.error || r.status !== 0) throw Object.assign(new Error(`git ${a.join(" ")}: ${r.error?.message || r.stderr.trim()}`), { code: "Git" }); return r.stdout.trim(); };
+const H = (...a) => { const r = run(herdr, a); if (r.error || r.status !== 0) throw Object.assign(new Error(`herdr ${a.join(" ")}: ${r.error?.message || (r.stderr || r.stdout).trim()}`), { code: "Herdr" }); try { return JSON.parse(r.stdout); } catch { return r.stdout; } };
 const herdrWorkspaces = () => { try { return H("workspace", "list").result.workspaces.map((w) => w.workspace_id); } catch { return []; } };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // focused directory / workspace from Herdr's context
 const ctx = (() => { try { return JSON.parse(process.env.HERDR_PLUGIN_CONTEXT_JSON || "{}"); } catch { return {}; } })();
 const findKey = (o, k) => { if (!o || typeof o !== "object") return; if (typeof o[k] === "string") return o[k]; for (const v of Object.values(o)) { const r = findKey(v, k); if (r) return r; } };
-const wsId = process.env.HERDR_WORKSPACE_ID || findKey(ctx, "workspace_id");
+let wsId = process.env.HERDR_WORKSPACE_ID || findKey(ctx, "workspace_id");
 const cwd = resolve(process.env.LFS_CWD || findKey(ctx, "cwd") || process.cwd());
 
 const { LayerFS } = await import(join(process.env.LAYERFS_API, "agent/sdk/src/index.js"));
@@ -82,7 +107,8 @@ function adminOf(p, gitBranch) {                                // <repo>/.git/w
   const root = join(git(p.source, "rev-parse", "--path-format=absolute", "--git-common-dir"), "worktrees");
   if (!existsSync(root)) return null;
   for (const id of readdirSync(root)) {
-    try { if (readFileSync(join(root, id, "HEAD"), "utf8").trim() === `ref: refs/heads/${gitBranch}`) return join(root, id); } catch {}
+    try { if (readFileSync(join(root, id, "HEAD"), "utf8").trim() === `ref: refs/heads/${gitBranch}`) return join(root, id); }
+    catch (err) { if (err.code !== "ENOENT") throw err; }
   }
   return null;
 }
@@ -110,8 +136,14 @@ function linkWorktree(e, p) {
   git(e.path, "reset", "-q");                                    // index from HEAD; the files are already there
 }
 function unlinkWorktree(e, p) {
-  const admin = (() => { try { return readFileSync(join(e.path, ".git"), "utf8").match(/^gitdir: (.*)$/m)?.[1]; } catch { return adminOf(p, e.gitBranch); } })();
-  if (admin && admin.includes("/worktrees/")) rmSync(admin, { recursive: true, force: true });
+  // The mount is already gone: locate only this branch's registration in the source repo.
+  // Do not use git worktree remove: it can delete the mount directory or another live view.
+  const admin = adminOf(p, e.gitBranch);
+  if (admin) {
+    if (resolve(readFileSync(join(admin, "gitdir"), "utf8").trim()) !== join(e.path, ".git"))
+      throw new Error(`Git worktree ${e.gitBranch} points elsewhere; inspect ${admin} before cleanup`);
+    rmSync(admin, { recursive: true, force: true });
+  }
 }
 
 // --- open the Herdr workspace for a mounted Workspace -------------------------------------------
@@ -149,9 +181,27 @@ async function dockerMounted(lf, e) {                           // the Sandbox s
 function leaveShells(e, p) {
   if (!p.container) return;
   const script = `for d in /proc/[0-9]*; do c=$(readlink "$d/cwd" 2>/dev/null) || continue; case "$c" in "$1"|"$1"/*) kill -HUP "\${d#/proc/}" 2>/dev/null;; esac; done; sleep 0.3`;
-  run("docker", ["exec", p.container, "sh", "-c", script, "sh", e.path]);
+  const r = run("docker", ["exec", p.container, "sh", "-c", script, "sh", e.path]);
+  if (r.error || r.status !== 0) throw new Error(`cannot stop workspace shells: ${r.error?.message || r.stderr.trim()}`);
 }
 
+// SSH/scripts have no Herdr ID. Resolve only local mounted paths, never container paths
+// or pending cleanup. Preserve explicit Herdr context even if its ID is unknown.
+if (!wsId && native && ["fork", "merge", "commit", "drop", "reopen"].includes(cmd)) {
+  const canonical = (path) => {
+    try { return realpathSync(path); }
+    catch (err) { if (["ENOENT", "ENOTDIR"].includes(err.code)) return null; throw err; }
+  };
+  const here = canonical(cwd);
+  const hits = here ? Object.entries(st.workspaces).filter(([, e]) => {
+    if (e.cleanup) return false;
+    const root = canonical(e.path);
+    return root && (here === root || here.startsWith(`${root}/`));
+  }) : [];
+  if (hits.length > 1) fail(`multiple LayerFS workspaces match ${cwd}; set HERDR_WORKSPACE_ID to the intended entry from lfs.mjs list`);
+  wsId = hits[0]?.[0];
+}
+const noBranch = () => fail(`no registered LayerFS branch for ${cwd}; run inside a mounted branch (or its subdirectory), set LFS_CWD to that path, or set HERDR_WORKSPACE_ID to its entry from lfs.mjs list; use the same LFS_STATE_DIR`);
 const entryHere = () => st.workspaces[wsId];
 const projectHere = () => entryHere()?.project
   || Object.entries(st.projects).find(([, p]) => p.source === cwd || p.source === gitTop(cwd))?.[0];
@@ -173,7 +223,20 @@ try {
       if (dirty) notify(`note: uncommitted changes in ${top} are not imported (HEAD ${base.slice(0, 9)} is)`);
     }
     notify(`importing ${source} as ${name}…`);
-    try { lf = await LayerFS.init(name, from, 1_800_000); } finally { if (tmp) rmSync(tmp, { recursive: true, force: true }); }
+    try {
+      // Never add rules to the source. Native git imports already own a disposable archive.
+      if (tmp && !existsSync(join(from, ".lww")) && existsSync(join(source, ".lww")))
+        copyFileSync(join(source, ".lww"), join(from, ".lww"));
+      if (process.env.LFS_NO_DEFAULT_LWW !== "1" && !existsSync(join(from, ".lww"))) {
+        if (!tmp) {
+          tmp = mkdtempSync(join(stDir, "seed-"));
+          cpSync(source, tmp, { recursive: true });
+          from = tmp;
+        }
+        writeFileSync(join(from, ".lww"), DEFAULT_LWW);
+      }
+      lf = await LayerFS.init(name, from, 1_800_000);
+    } finally { if (tmp) rmSync(tmp, { recursive: true, force: true }); }
     st.projects[name] = { source, git: !!(native && top), base, sandbox: null, container: null, herdrWs: wsId ?? null, n: 0 }; save();
     notify(`imported ${name}${base ? ` at ${base.slice(0, 9)}` : ""}`);
   } else if (cmd === "fork") {
@@ -187,12 +250,68 @@ try {
     await lf.branch.fork(branch, here?.branch);                  // from the focused LayerFS branch, else main
     const sb = await sandboxFor(lf, project);
     const w = await lf.workspace.mount(sb, branch);
-    const e = { project, branch, sandbox: sb, path: w.path, gitBranch: p.git ? `lfs/${branch}` : null,
+    const e = { project, branch, parent: here?.branch || "main", sandbox: sb, path: w.path, gitBranch: p.git ? `lfs/${branch}` : null,
       base: p.git ? (here ? git(here.path, "rev-parse", "HEAD") : p.base) : null };
     const id = await opened(lf, e, p, true);
     notify(`${branch} ready (${id})`);
+  } else if (cmd === "merge") {
+    const e = entryHere() || noBranch();
+    let withBranch, requestedName, open = false;
+    const args = process.argv.slice(3);
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === "--open" && !open) open = true;
+      else if (a === "--name" && requestedName === undefined && args[i + 1] && !args[i + 1].startsWith("-")) requestedName = args[++i];
+      else if (!a.startsWith("-") && withBranch === undefined) withBranch = a;
+      else fail(`invalid merge argument ${a}; use merge [with] [--name <new-branch>] [--open] (--publish and --strategy are not supported)`);
+    }
+    withBranch ??= e.parent || "main";
+    if (withBranch === e.branch) fail(`cannot merge ${e.branch} with itself; pass the other branch`);
+    const validName = (s) => /^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?$/.test(s) && s !== "main";
+    if (requestedName !== undefined && !validName(requestedName)) fail(`bad new branch name ${requestedName}`);
+    lf = await LayerFS.open(e.project);
+    // Choose a free name before attempting the merge; never replay a failed merge.
+    const names = new Set();
+    for (let pos = 0; ; ) {
+      const page = await lf.project.list_branches(50, pos);
+      for (const b of page.items) names.add(b.name);
+      if (!page.hasMore) break;
+      pos += page.items.length;
+    }
+    const stem = requestedName ?? (`${e.branch}-x-${withBranch}`.toLowerCase()
+      .replace(/[^a-z0-9._-]/g, "-").replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "").slice(0, 63).replace(/[^a-z0-9]+$/g, "") || "merge");
+    let name = stem;
+    for (let n = 2; names.has(name); n++) {
+      const suffix = `-${n}`;
+      name = stem.slice(0, 63 - suffix.length).replace(/[^a-z0-9]+$/g, "") + suffix;
+    }
+    await lf.workspace.commit({ sandbox: e.sandbox, path: e.path }, `herdr: before merge ${e.branch} with ${withBranch}`);
+    const p = st.projects[e.project];
+    // Native Git links belong to a mounted view, not either side's product changes.
+    // The root-anchored unit prevents conflicts (including directory contents); discard
+    // its provisional winner on the NEW branch and regenerate a private link on open.
+    const relink = native && p.git;
+    const merged = await lf.branch.merge(e.branch, withBranch, name, `herdr: merge ${e.branch} with ${withBranch}`,
+      relink ? [{ name: "herdr-root-git", patterns: ["/.git"] }] : undefined);
+    const meta = { parent: withBranch, gitBranch: p.git ? `lfs/${name}` : null,
+      base: p.git ? git(e.path, "rev-parse", "HEAD") : null };
+    p.closed ||= {}; p.closed[name] = meta; save();
+    if (relink) {
+      let present = true;
+      try { await lf.fs.stat(name, "/.git"); }
+      catch (err) { if (err.code !== "NoSuchPath") throw err; present = false; }
+      if (present) await lf.fs.rm(name, "/.git", "herdr: remove inherited root Git metadata before relinking");
+    }
+    notify(`merged ${e.branch} with ${withBranch} into new branch ${name} (${merged.fastForward ? "fast-forward" : "merge"}); inputs unchanged${merged.lww?.length ? `; lww: ${merged.lww.map((d) => `${d.path} (${d.kept})`).join(", ")}` : ""}`);
+    if (open) {
+      const sb = await sandboxFor(lf, e.project);
+      const w = await lf.workspace.mount(sb, name);
+      const id = await opened(lf, { project: e.project, branch: name, sandbox: sb, path: w.path, ...meta }, p, true);
+      delete p.closed[name]; save();
+      notify(`${name} ready (${id})`);
+    }
   } else if (cmd === "commit") {
-    const e = entryHere() || fail("this workspace is not a LayerFS branch");
+    const e = entryHere() || noBranch();
     lf = await LayerFS.open(e.project);
     await lf.workspace.commit({ sandbox: e.sandbox, path: e.path }, arg || `herdr: ${e.branch}`);
     notify(`committed ${e.branch}`);
@@ -200,20 +319,37 @@ try {
     let id = wsId;
     if (cmd === "on-close") id = findKey(JSON.parse(process.env.HERDR_PLUGIN_EVENT_JSON || "{}"), "workspace_id");
     const e = st.workspaces[id];
-    if (!e) { if (cmd === "on-close") process.exit(0); fail("this workspace is not a LayerFS branch"); }
+    if (!e) { if (cmd === "on-close") process.exit(0); noBranch(); }
+    if (cmd === "on-close" && e.cleanup) process.exit(0); // drop's close hook must not commit or unmount again
     const p = st.projects[e.project];
-    lf = await LayerFS.open(e.project);
     const ws = { sandbox: e.sandbox, path: e.path };
-    if (cmd === "on-close") await lf.workspace.commit(ws, `herdr: ${e.branch} (closed)`);
-    delete st.workspaces[id]; save();                             // first: our own workspace.closed hook then ignores it
-    if (cmd === "drop") { if (e.gitBranch) unlinkWorktree(e, p); try { H("workspace", "close", id); } catch {} }
-    if (!native) leaveShells(e, p);
-    for (let i = 0; ; i++) {                                      // the workspace's shells may still sit in the mount
-      try { await lf.workspace.unmount(ws, cmd === "drop"); break; }
-      catch (err) { if (!["Busy", "NoSuchWorkspace"].includes(err.code) || i >= 20) throw err; if (err.code === "NoSuchWorkspace") break; await sleep(500); }
+    try {
+      if (!e.cleanup?.unmounted) {
+        lf = await LayerFS.open(e.project);
+        if (cmd === "on-close") await lf.workspace.commit(ws, `herdr: ${e.branch} (closed)`);
+        if (!native) leaveShells(e, p);
+        await lf.workspace.unmount(ws, cmd === "drop"); // one attempt; Busy/uncertain failure retains the record
+        e.cleanup = { unmounted: true }; save();
+      }
+      if (cmd === "drop") {
+        if (!e.cleanup.unlinked) {
+          if (e.gitBranch) unlinkWorktree(e, p); // Git branches and LayerFS history are always kept
+          e.cleanup.unlinked = true; save();
+        }
+        if (!e.cleanup.closed) {
+          H("workspace", "close", id); // do not hide UI cleanup failures
+          e.cleanup.closed = true; save();
+        }
+      } else {
+        p.closed ||= {}; p.closed[e.branch] = { parent: e.parent || "main", gitBranch: e.gitBranch, base: e.base };
+      }
+      delete st.workspaces[id];
+      try { save(); } catch (err) { st.workspaces[id] = e; throw err; }
+    } catch (err) {
+      console.error(`Workspace record retained for ${id}. Close panes/processes using ${e.path}, leave that directory, then run drop again from another pane with HERDR_WORKSPACE_ID=${id}. If cleanup already unmounted it, drop resumes the remaining Git/Herdr cleanup. Inspect uncertain errors before continuing.`);
+      throw err;
     }
     notify(cmd === "drop" ? `discarded ${e.branch}${e.gitBranch ? ` (git branch ${e.gitBranch} kept)` : ""}` : `saved ${e.branch}; reopen it with "LayerFS: reopen branch"`);
-    if (cmd === "on-close") { p.closed ||= {}; p.closed[e.branch] = { gitBranch: e.gitBranch, base: e.base }; save(); }
   } else if (cmd === "reopen") {                                 // mount a saved branch again (arg = branch, default newest closed)
     const project = projectHere() || fail(`no LayerFS project for ${cwd}`);
     const p = st.projects[project]; const names = Object.keys(p.closed || {});
@@ -222,12 +358,13 @@ try {
     const sb = await sandboxFor(lf, project);
     const w = await lf.workspace.mount(sb, branch);
     const e = { project, branch, sandbox: sb, path: w.path, ...(p.closed?.[branch] ?? { gitBranch: null, base: null }) };
-    const id = await opened(lf, e, p, false);
+    const id = await opened(lf, e, p, true);
     delete p.closed?.[branch]; save();
     notify(`${branch} reopened (${id})`);
   } else if (cmd === "startup") {                                // after a reboot / server restart: remount and reopen
     const live = herdrWorkspaces(); let n = 0;
     for (const [id, e] of Object.entries(st.workspaces)) {
+      if (e.cleanup) { console.error(`cleanup pending for ${id} (${e.branch}); run drop with HERDR_WORKSPACE_ID=${id} to finish`); continue; }
       const p = st.projects[e.project];
       try {
         lf = await LayerFS.open(e.project);
@@ -256,5 +393,13 @@ try {
       for (const b of Object.keys(p.closed || {})) console.log(`  closed         ${b}`);
     }
   } else fail(`unknown command ${cmd}`);
-} catch (e) { fail(`${cmd}: ${e.code ?? ""} ${String(e.message).slice(0, 400)}`); }
+} catch (e) {
+  if (e.code === "Conflict") {
+    for (const c of e.detail?.conflicts ?? []) console.error(`${c.path}: ${c.kind}`);
+    if (e.detail?.conflictsTruncated) console.error("conflict list truncated by SDK; inspect both branches with branch.diff_branches");
+    console.error("Edit one side and merge again, or add generated paths to /.lww (rules come from the current branch). 改其中一边再 merge，或把生成文件路径加进 .lww。");
+  }
+  const msg = `${cmd}: ${e.code ?? ""} ${String(e.message).slice(0, 400)}`;
+  console.error(`layerfs: ${msg}`); notify(`error: ${msg}`); process.exitCode = 1;
+}
 finally { try { await lf?.close?.(); } catch {} }
