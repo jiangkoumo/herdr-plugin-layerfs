@@ -286,11 +286,22 @@ try {
       name = stem.slice(0, 63 - suffix.length).replace(/[^a-z0-9]+$/g, "") + suffix;
     }
     await lf.workspace.commit({ sandbox: e.sandbox, path: e.path }, `herdr: before merge ${e.branch} with ${withBranch}`);
-    const merged = await lf.branch.merge(e.branch, withBranch, name, `herdr: merge ${e.branch} with ${withBranch}`);
     const p = st.projects[e.project];
+    // Native Git links belong to a mounted view, not either side's product changes.
+    // The root-anchored unit prevents conflicts (including directory contents); discard
+    // its provisional winner on the NEW branch and regenerate a private link on open.
+    const relink = native && p.git;
+    const merged = await lf.branch.merge(e.branch, withBranch, name, `herdr: merge ${e.branch} with ${withBranch}`,
+      relink ? [{ name: "herdr-root-git", patterns: ["/.git"] }] : undefined);
     const meta = { parent: withBranch, gitBranch: p.git ? `lfs/${name}` : null,
       base: p.git ? git(e.path, "rev-parse", "HEAD") : null };
     p.closed ||= {}; p.closed[name] = meta; save();
+    if (relink) {
+      let present = true;
+      try { await lf.fs.stat(name, "/.git"); }
+      catch (err) { if (err.code !== "NoSuchPath") throw err; present = false; }
+      if (present) await lf.fs.rm(name, "/.git", "herdr: remove inherited root Git metadata before relinking");
+    }
     notify(`merged ${e.branch} with ${withBranch} into new branch ${name} (${merged.fastForward ? "fast-forward" : "merge"}); inputs unchanged${merged.lww?.length ? `; lww: ${merged.lww.map((d) => `${d.path} (${d.kept})`).join(", ")}` : ""}`);
     if (open) {
       const sb = await sandboxFor(lf, e.project);
@@ -347,7 +358,7 @@ try {
     const sb = await sandboxFor(lf, project);
     const w = await lf.workspace.mount(sb, branch);
     const e = { project, branch, sandbox: sb, path: w.path, ...(p.closed?.[branch] ?? { gitBranch: null, base: null }) };
-    const id = await opened(lf, e, p, false);
+    const id = await opened(lf, e, p, true);
     delete p.closed?.[branch]; save();
     notify(`${branch} reopened (${id})`);
   } else if (cmd === "startup") {                                // after a reboot / server restart: remount and reopen

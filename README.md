@@ -86,9 +86,16 @@ Herdr workspace, with git branch `lfs/<name>` in native mode. The parent is reta
 A conflict prints each reported path and type and exits nonzero; the merge creates no branch and both inputs
 keep their saved data. Edit one side and merge again, or add generated paths to the current branch's `/.lww`.
 The pre-merge workspace save can itself conflict if its branch moved; that is a Workspace commit conflict,
-so inspect and resolve the Workspace before continuing. No `--strategy` or merge-unit options are exposed.
+so inspect and resolve the Workspace before continuing. No `--strategy` or user-supplied merge-unit options are exposed.
 `--publish` is also unsupported: SDK publish replaces `main`'s view and may skip other publishers' changes
 made after the merge; it has no expected-main argument to guard the merge-to-publish gap atomically.
+
+Native Git-backed projects treat only root `/.git` (file or directory) as worktree metadata: an internal
+root-anchored merge unit prevents conflicts there, then the result branch removes the inherited metadata.
+Opening or reopening the result generates and saves its own `lfs/<name>` worktree link. Input links are kept;
+`sub/.git` and other nested paths still merge normally. This can add a cleanup Commit on the result branch.
+If cleanup fails after merge, the new branch remains recorded for inspection; do not replay the merge blindly.
+The plugin has no diff command; SDK diffs still describe complete trees, including Git metadata.
 
 **LayerFS merge does not merge git history.** Native `lfs/<name>` branches still use ordinary `git merge` for
 Git commits. Saving the current Workspace and linking the new one may change LayerFS commits, but never advance
@@ -187,6 +194,9 @@ node "$LFS"/lfs.mjs reopen [名字] | list
 不加 `--open` 可稍后 `reopen 新名`；加上会打开新工作区，native 模式配套 git 分支 `lfs/<新名>`。
 冲突会列路径和类型、非零退出、不创建结果分支；修改其中一边再合并，或把生成文件加入当前分支的 `.lww`。
 合并前会先保存当前工作区；若保存本身发生冲突，需要在原工作区解决。
+native Git 项目合并时只将根 `/.git` 当作工作区元数据：内部合并单元避免它冲突，随后移除结果中继承的内容；
+打开/重开结果时生成并保存专属的新链接，不复用输入分支的 Git 索引。子目录中的 `.git` 照常合并。
+插件没有 diff 命令；SDK diff 仍返回完整树，包含 Git 元数据。清理失败会保留新分支供检查，不自动重试合并。
 **LayerFS merge 不合并 git 历史，git 那边照常用 `git merge`。** 不提供 `ours/theirs`、units 或 `--publish`；
 SDK 的 publish 会替换 main 视图，可能跳过合并后别人的发布，无法在一个原子操作中校验 main 没变。
 
