@@ -15,6 +15,7 @@ indented under the repo in the sidebar, exactly like `herdr worktree`, and `git 
 | **LayerFS: new branch workspace** | Forks the project (or the focused LayerFS branch, after saving it) and opens it as a workspace named `lfs:agent-N`, on git branch `lfs/agent-N`. |
 | **LayerFS: new named branch** (pane) | Same, asks for the name. |
 | **LayerFS: commit this workspace** | Saves the workspace on its LayerFS branch. |
+| **LayerFS: merge with parent** | Saves this workspace, then merges with its recorded parent (or `main`) into a new branch. Both inputs are kept. |
 | **LayerFS: discard this workspace** | Closes it and unmounts without saving. The git branch is kept. |
 | **LayerFS: reopen last closed branch** | Mounts a saved branch again. |
 | **LayerFS: status** (pane) | Projects, open and closed branches. |
@@ -64,7 +65,39 @@ There is no `herdr layerfs` subcommand. Herdr plugins are run in three ways:
 | Herdr CLI | `herdr plugin action invoke layerfs.<action>`, or `herdr plugin pane open --plugin layerfs --entrypoint fork-named` / `status` |
 | A shell or an agent | `node "$LFS"/lfs.mjs <command> [name]` (see below) |
 
-Actions: `layerfs.init`, `layerfs.fork`, `layerfs.commit`, `layerfs.reopen`, `layerfs.drop`.
+Actions: `layerfs.init`, `layerfs.fork`, `layerfs.commit`, `layerfs.merge`, `layerfs.reopen`, `layerfs.drop`.
+
+`node lfs.mjs merge [with] [--name <new-branch>] [--open]` creates a new LayerFS branch.
+It first saves the current workspace, then merges its branch with `with` (default: the parent recorded at fork;
+older entries fall back to `main`). The default name is `<current>-x-<with>`, normalized to a valid name;
+occupied names, including an explicit `--name`, receive `-2`, `-3`, … suffixes. A concurrent name collision is
+reported without retrying. Without `--open`, use `reopen <name>` later; `--open` mounts the result and opens a
+Herdr workspace, with git branch `lfs/<name>` in native mode. The parent is retained across close/reopen.
+
+A conflict prints each reported path and type and exits nonzero; the merge creates no branch and both inputs
+keep their saved data. Edit one side and merge again, or add generated paths to the current branch's `/.lww`.
+The pre-merge workspace save can itself conflict if its branch moved; that is a Workspace commit conflict,
+so inspect and resolve the Workspace before continuing. No `--strategy` or merge-unit options are exposed.
+`--publish` is also unsupported: SDK publish replaces `main`'s view and may skip other publishers' changes
+made after the merge; it has no expected-main argument to guard the merge-to-publish gap atomically.
+
+**LayerFS merge does not merge git history.** Native `lfs/<name>` branches still use ordinary `git merge` for
+Git commits. Saving the current Workspace and linking the new one may change LayerFS commits, but never advance
+Git refs or create Git merge commits on the input branches.
+
+### Default merge rules
+
+On import, if there is no root `.lww`, the plugin adds one **only to the imported copy**. It includes
+`%include .gitignore` (a missing file is skipped), common lockfiles, `*.log`, dependency/build output and test
+caches. These files remain stored in LayerFS; on conflicting edits the newer version is kept whole, dropping
+the other edit (ties keep the current branch). Rules are read from the first input, the current branch.
+Existing `.lww` files are preserved, including an untracked root `.lww` in a native Git source; that rules file
+is the exception to the HEAD-only import. Other uncommitted files are not imported in native Git mode.
+A source that is not a Git checkout (docker mode) is copied once to a temporary folder for the import, so it
+needs free space about the size of that source; native Git sources keep using the smaller `git archive`.
+Set `LFS_NO_DEFAULT_LWW=1` in `config.env` or the command environment **before init** to disable generation.
+It does not remove existing rules or alter an already imported project. Review your rules before merging;
+add source-file exceptions such as `!src/generated-manually.js` if your `.gitignore` is broader than desired.
 
 ```toml
 # Herdr config
@@ -87,6 +120,8 @@ LFS=$(herdr plugin list --plugin layerfs --json | jq -r '.result.plugins[0].plug
 node "$LFS"/lfs.mjs init            # once per repo, from the repo's workspace: import HEAD
 node "$LFS"/lfs.mjs fork fix-login  # new branch workspace lfs:fix-login on git branch lfs/fix-login (name optional)
 node "$LFS"/lfs.mjs commit          # from inside a branch workspace: save it
+node "$LFS"/lfs.mjs merge           # merge with recorded parent into a new branch (no mount)
+node "$LFS"/lfs.mjs merge main --name release-check --open  # mount and open the result
 node "$LFS"/lfs.mjs reopen [name]   # mount a saved branch again (default: newest closed)
 node "$LFS"/lfs.mjs drop            # from inside a branch workspace: discard it (git branch kept)
 node "$LFS"/lfs.mjs list            # projects and branches
@@ -125,8 +160,23 @@ LFS=$(herdr plugin list --plugin layerfs --json | jq -r '.result.plugins[0].plug
 node "$LFS"/lfs.mjs init            # 每个仓库一次，在仓库工作区里跑
 node "$LFS"/lfs.mjs fork 名字        # 开新分支工作区（名字可省，只能 a-z0-9-）
 node "$LFS"/lfs.mjs commit | drop   # 在分支工作区里：保存 / 丢弃
+node "$LFS"/lfs.mjs merge           # 先保存，再与 fork 的父分支合并，生成新分支
+node "$LFS"/lfs.mjs merge main --name release-check --open  # 指定另一边、结果名并打开
 node "$LFS"/lfs.mjs reopen [名字] | list
 ```
+
+`merge [with] [--name 新名] [--open]` 默认与 fork 时记录的父分支合并，老状态没有记录就用 `main`。
+默认新名为 `<当前>-x-<with>`，重名自动加 `-2`、`-3`；合并创建新分支，两个输入分支保持不变。
+不加 `--open` 可稍后 `reopen 新名`；加上会打开新工作区，native 模式配套 git 分支 `lfs/<新名>`。
+冲突会列路径和类型、非零退出、不创建结果分支；修改其中一边再合并，或把生成文件加入当前分支的 `.lww`。
+合并前会先保存当前工作区；若保存本身发生冲突，需要在原工作区解决。
+**LayerFS merge 不合并 git 历史，git 那边照常用 `git merge`。** 不提供 `ours/theirs`、units 或 `--publish`；
+SDK 的 publish 会替换 main 视图，可能跳过合并后别人的发布，无法在一个原子操作中校验 main 没变。
+
+`init` 默认只在导入副本里生成 `.lww`，不修改源仓库；规则含 `%include .gitignore`、常见 lockfile、日志和构建/测试缓存。
+已有规则保留（native Git 源仓库中未跟踪的根 `.lww` 也保留，这是 HEAD 导入的例外）。合并读取第一个输入，即当前分支的规则，
+匹配的文件双方都改时整份保留较新的版本，会舍弃另一份修改。导入前设 `LFS_NO_DEFAULT_LWW=1` 可关闭默认生成，
+不影响已有规则和已经导入的项目。
 
 装好后先在 Herdr 里随便跑一次 LayerFS 动作（记录状态目录），之后 agent 直接跑的脚本才能共用状态。
 

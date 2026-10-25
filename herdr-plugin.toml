@@ -26,6 +26,13 @@ contexts = ["pane", "tab", "workspace"]
 command = ["node", "lfs.mjs", "commit"]
 
 [[actions]]
+id = "merge"
+title = "LayerFS: merge with parent"
+description = "Save this workspace and merge with its parent into a new branch; inputs are kept"
+contexts = ["pane", "tab", "workspace"]
+command = ["node", "lfs.mjs", "merge"]
+
+[[actions]]
 id = "reopen"
 title = "LayerFS: reopen last closed branch"
 contexts = ["pane", "tab", "workspace"]
