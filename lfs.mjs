@@ -189,6 +189,16 @@ function unlinkWorktree(e, p) {
   }
 }
 
+// Remember only a caller whose Herdr checkout belongs to this repository. Shell cwd alone
+// is insufficient: an agent in a non-Git root workspace may cd into the source repo.
+function rememberHerdr(p) {
+  if (!wsId || !p.git) return;
+  try {
+    const source = H("worktree", "list", "--workspace", wsId)?.result?.source;
+    if (source?.repo_key && realpathSync(source.repo_key) === realpathSync(git(p.source, "rev-parse", "--path-format=absolute", "--git-common-dir"))) p.herdrWs = wsId;
+  } catch {} // no caller routing is needed; openHerdr can use the source checkout
+}
+
 // --- open the Herdr workspace for a mounted Workspace -------------------------------------------
 function openHerdr(e, p) {
   if (native && e.gitBranch) {
@@ -216,7 +226,13 @@ async function opened(lf, e, p, fresh) {
     st.workspaces[id] = e; save();
     return id;
   } catch (err) {
-    try { await lf.workspace.unmount({ sandbox: e.sandbox, path: e.path }, fresh); } catch {}
+    try {
+      await lf.workspace.unmount({ sandbox: e.sandbox, path: e.path }, fresh);
+      if (e.gitBranch) unlinkWorktree(e, p);
+    } catch (cleanup) {
+      err.cleanupFailed = `${cleanup.code ?? ""} ${cleanup.message}`.trim();
+      err.message += `; cleanup failed: ${err.cleanupFailed}; inspect ${e.path} before retrying`;
+    }
     throw err;
   }
 }
@@ -254,6 +270,51 @@ const noBranch = () => fail(`no registered LayerFS branch for ${cwd}; run inside
 const entryHere = () => st.workspaces[wsId];
 const projectHere = () => entryHere()?.project
   || Object.entries(st.projects).find(([, p]) => p.source === cwd || p.source === gitTop(cwd))?.[0];
+const branchNames = async (lf) => {
+  const names = new Set();
+  for (let pos = 0; ; ) {
+    const page = await lf.project.list_branches(50, pos);
+    for (const b of page.items) names.add(b.name);
+    if (!page.hasMore) return names;
+    pos += page.items.length;
+  }
+};
+const existingAdvice = (project, branch) => {
+  const ids = Object.entries(st.workspaces).filter(([, e]) => e.project === project && e.branch === branch).map(([id]) => id);
+  return ids.length ? `branch ${branch} is already open as workspace ${ids.join(", ")}; use that workspace`
+    : `branch ${branch} already exists (possibly left by a failed fork); use reopen ${branch} to attach it, or choose another name`;
+};
+async function openClosed(lf, project, branch, p) {
+  const meta = p.closed[branch];
+  if (meta.cleanupFailed) throw new Error(`cleanup for ${branch} needs inspection at ${meta.path}: ${meta.cleanupFailed}; do not retry an uncertain unmount automatically`);
+  try {
+    const sb = await sandboxFor(lf, project);
+    let w;
+    try { w = await lf.workspace.mount(sb, branch); }
+    catch (err) {
+      // The public list filters out attaching/unmounted views and is paginated. Even
+      // zero matches cannot prove a failed mount had no effect. Never replay it.
+      err.cleanupFailed = `mount result unknown in Sandbox ${sb}; inspect before any retry`;
+      try {
+        const live = ((await lf.sandbox.list_workspaces(sb)).items ?? []).filter(e => e.branch === branch);
+        if (live.length) meta.path = live[0].path;
+        err.cleanupFailed += `; ${live.length} matching mounted view(s) on the inspected page (not an exhaustive result)`;
+      } catch (inspection) { err.cleanupFailed += `; inspection failed: ${inspection.message}`; }
+      throw err;
+    }
+    meta.path = w.path; save();
+    const id = await opened(lf, { project, branch, sandbox: sb, ...meta }, p, true);
+    delete p.closed[branch]; save();
+    return id;
+  } catch (err) {
+    meta.failed = `${err.code ?? ""} ${err.message}`.trim().replace(/\s+/g, " ").slice(0, 500);
+    if (err.cleanupFailed) meta.cleanupFailed = err.cleanupFailed;
+    save();
+    // Keep recovery commands outside the bounded SDK/CLI error summary.
+    console.error(`LayerFS branch ${branch} kept: use reopen ${branch} to retry or drop ${branch} to forget its plugin record (Store history kept).${meta.cleanupFailed ? ` Inspect failed cleanup at ${meta.path ?? "the Sandbox"} first: ${meta.cleanupFailed}` : ""}`);
+    throw err;
+  }
+}
 
 let lf;
 try {
@@ -286,22 +347,24 @@ try {
       }
       lf = await LayerFS.init(name, from, 1_800_000);
     } finally { if (tmp) rmSync(tmp, { recursive: true, force: true }); }
-    st.projects[name] = { source, git: !!(native && top), base, sandbox: null, container: null, herdrWs: wsId ?? null, n: 0 }; save();
+    st.projects[name] = { source, git: !!(native && top), base, sandbox: null, container: null, herdrWs: null, n: 0 };
+    rememberHerdr(st.projects[name]); save();
     notify(`imported ${name}${base ? ` at ${base.slice(0, 9)}` : ""}`);
   } else if (cmd === "fork") {
     const here = entryHere();
     const project = projectHere() || fail(`no LayerFS project for ${cwd}; run "LayerFS: import this repo" first`);
-    const p = st.projects[project]; if (!here && wsId) p.herdrWs = wsId;
+    const p = st.projects[project]; if (!here) rememberHerdr(p);
     lf = await LayerFS.open(project);
     const branch = arg || `agent-${++p.n}`; save();
     if (!/^[a-z0-9][a-z0-9._-]{0,62}$/.test(branch)) fail(`bad branch name ${branch}`);
-    if (here) await lf.workspace.commit({ sandbox: here.sandbox, path: here.path }, `herdr: before fork ${branch}`); // fork sees saved state only
-    await lf.branch.fork(branch, here?.branch);                  // from the focused LayerFS branch, else main
-    const sb = await sandboxFor(lf, project);
-    const w = await lf.workspace.mount(sb, branch);
-    const e = { project, branch, parent: here?.branch || "main", sandbox: sb, path: w.path, gitBranch: p.git ? `lfs/${branch}` : null,
+    if ((await branchNames(lf)).has(branch)) throw new Error(existingAdvice(project, branch));
+    const meta = { parent: here?.branch || "main", gitBranch: p.git ? `lfs/${branch}` : null,
       base: p.git ? (here ? git(here.path, "rev-parse", "HEAD") : p.base) : null };
-    const id = await opened(lf, e, p, true);
+    if (here) await lf.workspace.commit({ sandbox: here.sandbox, path: here.path }, `herdr: before fork ${branch}`); // fork sees saved state only
+    try { await lf.branch.fork(branch, here?.branch); }           // never replay an uncertain write
+    catch (err) { if (err.code === "NameTaken") err.message = existingAdvice(project, branch); throw err; }
+    p.closed ||= {}; p.closed[branch] = meta; save();             // durable before sandbox/mount/link/open
+    const id = await openClosed(lf, project, branch, p);
     notify(`${branch} ready (${id})`);
   } else if (cmd === "merge") {
     const e = entryHere() || noBranch();
@@ -383,6 +446,7 @@ try {
         if (!id) {
           const closed = p.closed && Object.hasOwn(p.closed, name) ? p.closed[name] : null;
           if (!closed) { notify(`no plugin record for ${name}; nothing to drop. ${historyKept}`); process.exit(0); }
+          if (closed.cleanupFailed) throw new Error(`cleanup for ${name} needs inspection at ${closed.path}: ${closed.cleanupFailed}; record kept`);
           cleanClosed(closed, p, deleteGit);
           delete p.closed[name];
           try { save(); } catch (err) { p.closed[name] = closed; throw err; }
@@ -429,12 +493,15 @@ try {
     const project = projectHere() || fail(`no LayerFS project for ${cwd}`);
     const p = st.projects[project]; const names = Object.keys(p.closed || {});
     const branch = arg || names.at(-1) || fail("no closed LayerFS branch to reopen");
+    if (Object.values(st.workspaces).some(e => e.project === project && e.branch === branch)) throw new Error(`branch ${branch} is already open; use list to find its workspace`);
     lf = await LayerFS.open(project);
-    const sb = await sandboxFor(lf, project);
-    const w = await lf.workspace.mount(sb, branch);
-    const e = { project, branch, sandbox: sb, path: w.path, ...(p.closed?.[branch] ?? { gitBranch: null, base: null }) };
-    const id = await opened(lf, e, p, true);
-    delete p.closed?.[branch]; save();
+    if (!(await branchNames(lf)).has(branch)) throw new Error(`no LayerFS branch ${branch}`);
+    p.closed ||= {};
+    if (!Object.hasOwn(p.closed, branch)) {
+      p.closed[branch] = { parent: "main", gitBranch: p.git ? `lfs/${branch}` : null, base: p.base };
+      save(); // adopt existing Store history without forking or deleting it
+    }
+    const id = await openClosed(lf, project, branch, p);
     notify(`${branch} reopened (${id})`);
   } else if (cmd === "startup") {                                // after a reboot / server restart: remount and reopen
     const live = herdrWorkspaces(); let n = 0;
@@ -465,7 +532,7 @@ try {
       console.log(`${name}  ← ${p.source}${p.base ? ` @${p.base.slice(0, 9)}` : ""}  sandbox=${p.sandbox ?? "-"}`);
       for (const [id, e] of Object.entries(st.workspaces).filter(([, e]) => e.project === name))
         console.log(`  open    ${id.padEnd(6)} ${e.branch.padEnd(20)} ${e.gitBranch ?? ""}  ${e.path}`);
-      for (const b of Object.keys(p.closed || {})) console.log(`  closed         ${b}`);
+      for (const [b, e] of Object.entries(p.closed || {})) console.log(`  closed         ${b}${e.failed ? ` (fork failed: ${e.failed})` : ""}${e.cleanupFailed ? " [cleanup needs inspection]" : ""}`);
     }
   } else fail(`unknown command ${cmd}`);
 } catch (e) {
