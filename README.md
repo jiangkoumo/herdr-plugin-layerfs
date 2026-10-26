@@ -7,6 +7,14 @@ indented under the repo in the sidebar, exactly like `herdr worktree`, and `git 
 
 [中文说明](#中文说明)
 
+## Changes in 0.3.2
+
+- A failed fork keeps a closed plugin record with its error and recovery commands. After a successful unmount,
+  only that branch's Git worktree registration is cleaned; Git branches and LayerFS history are kept.
+- `reopen <name>` can recover an existing Store branch even without a plugin record, including its native Git link.
+- Caller workspace routing is recorded only after Herdr confirms it belongs to the source repository; a non-Git
+  controller workspace uses the source checkout to open the branch in the sidebar.
+
 ## Changes in 0.3.1
 
 - `drop [name] [--delete-git-branch]` forgets open or closed plugin records. Closed records need no remount.
@@ -118,6 +126,20 @@ The plugin has no diff command; SDK diffs still describe complete trees, includi
 Git commits. Saving the current Workspace and linking the new one may change LayerFS commits, but never advance
 Git refs or create Git merge commits on the input branches.
 
+### Recovering a failed fork
+
+If a fork fails after creating its LayerFS branch (Sandbox, mount, Git link or Herdr open), the branch is recorded
+as closed. `list` shows `closed <name> (fork failed: ...)`. The plugin attempts one unmount and removes only the
+matching Git worktree registration after unmount succeeds. The Git branch and Store history stay available.
+Run `reopen <name>` to retry opening, or `drop <name>` to forget the plugin record. If cleanup failed, inspect
+its reported path and error first; automatic reopen/drop is blocked to avoid touching an uncertain live view.
+
+A duplicate `fork <name>` suggests `reopen <name>` or a different name. Explicit `reopen <name>` also recovers
+an existing Store branch with no plugin record: it records default parent `main` and, in native Git projects,
+links `lfs/<name>` using the import base (an existing Git branch keeps its commits). Original parent/base
+metadata cannot be inferred for an unrecorded branch. Reopening an already recorded open branch is refused.
+`drop` forgets only plugin records; Store names remain occupied afterward. There is no `adopt` command.
+
 ### Dropping a workspace record
 
 Run `node lfs.mjs drop <name>` from the source repo or a registered workspace of the project. Without a name,
@@ -184,7 +206,10 @@ node "$LFS"/lfs.mjs list            # projects and branches
 ```
 
 - Run `fork` from the source repo's workspace for a fresh branch, or from a branch workspace to fork that branch
-  (it is saved first).
+  (it is saved first). From a controller pane outside Git, set `LFS_CWD` to the source repo; the plugin opens
+  through the source checkout instead of caching the controller's workspace as the sidebar parent.
+- After a failed fork, use `list`, then `reopen <name>` or `drop <name>`. A missing plugin record can be recovered
+  with explicit `reopen <name>` if the branch still exists in the same Store and project.
 - The new workspace opens in Herdr; in native mode its path is a normal folder (the repo's linked git worktree), so
   the agent can `cd` there or start another agent in it with `herdr`.
 - Run any LayerFS action from Herdr once after installing: it records where the plugin keeps its state, so direct
@@ -208,6 +233,12 @@ node "$LFS"/lfs.mjs list            # projects and branches
 把 LayerFS 分支变成 Herdr 工作区：开一个新分支约 2 秒、几乎不占磁盘。native 模式下每个分支同时是源仓库的
 git worktree，所以会像 `herdr worktree` 一样缩进挂在仓库工作区下面（树状），里面照常 `git commit`、`git push`。
 关闭工作区自动保存并卸载；herdr 重启或电脑重启后，`startup` 钩子会重新挂载并恢复工作区。
+
+0.3.2 在 fork 创建分支后失败时保存 closed 记录，`list` 显示失败摘要；卸载成功后仅清理该分支的 Git worktree 注册。
+可 `reopen 名字` 重试（也支持 Store 已有但插件无记录的分支，恢复 Git 链接），或 `drop 名字` 忘记记录。
+卸载/清理失败会保留证据并要求先检查；不自动重放未知结果的写操作。drop 后 Store 名字仍占用，需 reopen 或换名。
+主控 pane 在非 Git 目录时可设 `LFS_CWD=源仓库`；仅当 Herdr 确认调用者属于同一仓库才记为侧栏父工作区。
+无记录恢复无法推断原 parent/base，使用 main 和导入基点；现有 Git 分支的提交仍保留。没有单独的 adopt 命令。
 
 0.3.1 支持从源仓库执行 `drop 名字 [--delete-git-branch]`：closed 记录直接清理，不重挂载；默认保留 Git 分支。
 可选删除 Git 分支要求它已并入源仓库 HEAD 且 `git branch -d` 成功，失败保留插件记录；不存在的记录重复 drop 成功。
