@@ -192,8 +192,14 @@ function unlinkWorktree(e, p) {
 // --- open the Herdr workspace for a mounted Workspace -------------------------------------------
 function openHerdr(e, p) {
   if (native && e.gitBranch) {
-    const parent = herdrWorkspaces().includes(p.herdrWs) ? ["--workspace", p.herdrWs] : ["--cwd", p.source];
-    const r = H("worktree", "open", ...parent, "--path", e.path, "--label", `lfs:${e.branch}`, "--no-focus");
+    const open = (parent) => H("worktree", "open", ...parent, "--path", e.path, "--label", `lfs:${e.branch}`, "--no-focus");
+    let r;
+    if (p.herdrWs && herdrWorkspaces().includes(p.herdrWs)) {
+      // the recorded workspace may be the caller's (e.g. an agent pane outside the repo): fall back to the repo itself
+      try { r = open(["--workspace", p.herdrWs]); }
+      catch (err) { if (!/not_git_worktree/.test(err.message)) throw err; p.herdrWs = null; save(); }
+    }
+    r ??= open(["--cwd", p.source]);
     return r?.result?.workspace?.workspace_id ?? findKey(r, "workspace_id");
   }
   const r = H("workspace", "create", "--cwd", native ? e.path : p.source, "--label", `lfs:${e.branch}`, "--no-focus");
@@ -472,3 +478,4 @@ try {
   console.error(`layerfs: ${msg}`); notify(`error: ${msg}`); process.exitCode = 1;
 }
 finally { try { await lf?.close?.(); } catch {} }
+ 
