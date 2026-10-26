@@ -5,6 +5,7 @@ import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+mkdirSync('/Users/jiangkoumo/LayerFS/tmp/h14', { recursive: true });
 const dir = process.env.H14_RESUME || mkdtempSync('/Users/jiangkoumo/LayerFS/tmp/h14/native-');
 const repo = join(dir, 'repo'), state = join(dir, 'state'), config = join(dir, 'config');
 for (const p of [repo, state, config]) mkdirSync(p, { recursive: true });

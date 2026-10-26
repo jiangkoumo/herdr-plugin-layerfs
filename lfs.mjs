@@ -279,7 +279,11 @@ const branchNames = async (lf) => {
     pos += page.items.length;
   }
 };
-const existingAdvice = branch => `branch ${branch} already exists (possibly left by a failed fork); use reopen ${branch} to attach it, or choose another name`;
+const existingAdvice = (project, branch) => {
+  const ids = Object.entries(st.workspaces).filter(([, e]) => e.project === project && e.branch === branch).map(([id]) => id);
+  return ids.length ? `branch ${branch} is already open as workspace ${ids.join(", ")}; use that workspace`
+    : `branch ${branch} already exists (possibly left by a failed fork); use reopen ${branch} to attach it, or choose another name`;
+};
 async function openClosed(lf, project, branch, p) {
   const meta = p.closed[branch];
   if (meta.cleanupFailed) throw new Error(`cleanup for ${branch} needs inspection at ${meta.path}: ${meta.cleanupFailed}; do not retry an uncertain unmount automatically`);
@@ -288,14 +292,14 @@ async function openClosed(lf, project, branch, p) {
     let w;
     try { w = await lf.workspace.mount(sb, branch); }
     catch (err) {
-      // A failed response need not mean no mount was created. Inspect, never replay it.
+      // The public list filters out attaching/unmounted views and is paginated. Even
+      // zero matches cannot prove a failed mount had no effect. Never replay it.
+      err.cleanupFailed = `mount result unknown in Sandbox ${sb}; inspect before any retry`;
       try {
         const live = ((await lf.sandbox.list_workspaces(sb)).items ?? []).filter(e => e.branch === branch);
-        if (live.length) {
-          meta.path = live[0].path;
-          err.cleanupFailed = `mount returned an error but ${live.length} live view(s) remain; inspect Sandbox ${sb}`;
-        }
-      } catch (inspection) { err.cleanupFailed = `cannot determine mount result in Sandbox ${sb}: ${inspection.message}`; }
+        if (live.length) meta.path = live[0].path;
+        err.cleanupFailed += `; ${live.length} matching mounted view(s) on the inspected page (not an exhaustive result)`;
+      } catch (inspection) { err.cleanupFailed += `; inspection failed: ${inspection.message}`; }
       throw err;
     }
     meta.path = w.path; save();
@@ -353,12 +357,12 @@ try {
     lf = await LayerFS.open(project);
     const branch = arg || `agent-${++p.n}`; save();
     if (!/^[a-z0-9][a-z0-9._-]{0,62}$/.test(branch)) fail(`bad branch name ${branch}`);
-    if ((await branchNames(lf)).has(branch)) throw new Error(existingAdvice(branch));
+    if ((await branchNames(lf)).has(branch)) throw new Error(existingAdvice(project, branch));
     const meta = { parent: here?.branch || "main", gitBranch: p.git ? `lfs/${branch}` : null,
       base: p.git ? (here ? git(here.path, "rev-parse", "HEAD") : p.base) : null };
     if (here) await lf.workspace.commit({ sandbox: here.sandbox, path: here.path }, `herdr: before fork ${branch}`); // fork sees saved state only
     try { await lf.branch.fork(branch, here?.branch); }           // never replay an uncertain write
-    catch (err) { if (err.code === "NameTaken") err.message = existingAdvice(branch); throw err; }
+    catch (err) { if (err.code === "NameTaken") err.message = existingAdvice(project, branch); throw err; }
     p.closed ||= {}; p.closed[branch] = meta; save();             // durable before sandbox/mount/link/open
     const id = await openClosed(lf, project, branch, p);
     notify(`${branch} ready (${id})`);

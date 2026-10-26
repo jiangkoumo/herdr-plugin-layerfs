@@ -131,11 +131,14 @@ Git refs or create Git merge commits on the input branches.
 If a fork fails after creating its LayerFS branch (Sandbox, mount, Git link or Herdr open), the branch is recorded
 as closed. `list` shows `closed <name> (fork failed: ...)`. The plugin attempts one unmount and removes only the
 matching Git worktree registration after unmount succeeds. The Git branch and Store history stay available.
-Run `reopen <name>` to retry opening, or `drop <name>` to forget the plugin record. If cleanup failed, inspect
-its reported path and error first; automatic reopen/drop is blocked to avoid touching an uncertain live view.
+After successful cleanup, run `reopen <name>` to retry opening, or `drop <name>` to forget the plugin record.
+If cleanup failed, inspect its reported path and error first; automatic reopen/drop is blocked. Any mount
+exception is conservatively recorded as an unknown result and also blocks reopen/drop, even if the public
+workspace list is empty: that list filters out pending/unmounted views and may not cover every page. The
+plugin does not infer a before-effect refusal from that list or automatically clear this inspection guard.
 
-A duplicate `fork <name>` suggests `reopen <name>` or a different name. Explicit `reopen <name>` also recovers
-an existing Store branch with no plugin record: it records default parent `main` and, in native Git projects,
+A duplicate `fork <name>` identifies the workspace ID if already open; otherwise it suggests `reopen <name>`
+or a different name. Explicit `reopen <name>` also recovers an existing Store branch with no plugin record: it records default parent `main` and, in native Git projects,
 links `lfs/<name>` using the import base (an existing Git branch keeps its commits). Original parent/base
 metadata cannot be inferred for an unrecorded branch. Reopening an already recorded open branch is refused.
 `drop` forgets only plugin records; Store names remain occupied afterward. There is no `adopt` command.
@@ -236,7 +239,9 @@ git worktree，所以会像 `herdr worktree` 一样缩进挂在仓库工作区�
 
 0.3.2 在 fork 创建分支后失败时保存 closed 记录，`list` 显示失败摘要；卸载成功后仅清理该分支的 Git worktree 注册。
 可 `reopen 名字` 重试（也支持 Store 已有但插件无记录的分支，恢复 Git 链接），或 `drop 名字` 忘记记录。
-卸载/清理失败会保留证据并要求先检查；不自动重放未知结果的写操作。drop 后 Store 名字仍占用，需 reopen 或换名。
+卸载/清理失败会保留证据并要求先检查；所有 mount 异常也保守记为结果未知，阻止自动 reopen/drop。
+公开挂载列表会过滤 pending/unmounted 视图且有分页，零条不足以证明没有副作用；检查门禁不会自动清除。
+重复 fork 已打开分支直接提示 workspace ID；closed/无记录分支提示 reopen。drop 后 Store 名字仍占用，需 reopen 或换名。
 主控 pane 在非 Git 目录时可设 `LFS_CWD=源仓库`；仅当 Herdr 确认调用者属于同一仓库才记为侧栏父工作区。
 无记录恢复无法推断原 parent/base，使用 main 和导入基点；现有 Git 分支的提交仍保留。没有单独的 adopt 命令。
 

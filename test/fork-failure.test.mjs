@@ -48,8 +48,8 @@ test('fork failure is closed, unmounted and unlinked; reopen/drop keep Store his
   } finally { f.cleanup(); }
 });
 
-test('mount, sandbox and link failures retain recoverable metadata', () => {
-  for (const fault of ['mount', 'sandbox', 'commit']) {
+test('sandbox and commit failures retain recoverable metadata', () => {
+  for (const fault of ['sandbox', 'commit']) {
     const f = fixture();
     try {
       assert.equal(f.call(['fork', 'broken'], { H14_FAULT: fault }).status, 1);
@@ -64,7 +64,7 @@ test('mount, sandbox and link failures retain recoverable metadata', () => {
 test('unmount failure retains evidence and blocks unsafe reopen/drop', () => {
   const f = fixture();
   try {
-    // commit and unmount both fail: a second fault is supported via the fixture environment.
+    // Herdr open and unmount both fail via independent fixture faults.
     const r = f.call(['fork', 'broken'], { H14_FAULT: 'herdr', H14_UNMOUNT_FAIL: '1' });
     assert.equal(r.status, 1);
     const e = f.read().projects.h14.closed.broken;
@@ -80,11 +80,63 @@ test('uncertain mount response is inspected and not replayed', () => {
   try {
     assert.equal(f.call(['fork', 'broken'], { H14_FAULT: 'mount-response' }).status, 1);
     const e = f.read().projects.h14.closed.broken;
-    assert.match(e.cleanupFailed, /live view/);
+    assert.match(e.cleanupFailed, /mount result unknown/);
     assert.equal(Object.keys(f.sdk().mounts).length, 1);
     assert.equal(f.call(['reopen', 'broken']).status, 1);
     assert.equal(Object.keys(f.sdk().mounts).length, 1);
     assert.equal(f.call(['drop', 'broken']).status, 1);
+  } finally { f.cleanup(); }
+});
+
+test('empty mount list cannot prove no effect, including a filtered pending view', () => {
+  for (const fault of ['mount', 'mount-pending']) {
+    const f = fixture();
+    try {
+      assert.equal(f.call(['fork', 'broken'], { H14_FAULT: fault }).status, 1);
+      const before = f.sdk();
+      assert.equal(Object.values(before.mounts).filter(w => w.mounted && w.directory).length, 0);
+      assert.equal(Object.keys(before.mounts).length, fault === 'mount-pending' ? 1 : 0);
+      assert.match(f.read().projects.h14.closed.broken.cleanupFailed, /mount result unknown/);
+      assert.equal(f.call(['reopen', 'broken']).status, 1);
+      assert.equal(f.call(['drop', 'broken']).status, 1);
+      assert.deepEqual(f.sdk(), before);
+    } finally { f.cleanup(); }
+  }
+});
+
+test('Git link index-reset failure cleans only its admin and preserves both Git branches', () => {
+  const f = fixture();
+  try {
+    f.ok(['fork', 'other']);
+    const other = Object.values(f.read().workspaces)[0];
+    const otherAdmin = readFileSync(join(other.path, '.git'), 'utf8').trim().replace(/^gitdir: /, '');
+    const otherHead = readFileSync(join(otherAdmin, 'HEAD'), 'utf8');
+    const otherBacklink = readFileSync(join(otherAdmin, 'gitdir'), 'utf8');
+    const bin = join(f.dir, 'bin'); mkdirSync(bin);
+    const actualGit = run('which', ['git']); assert.equal(actualGit.status, 0);
+    const shim = join(bin, 'git');
+    writeFileSync(shim, `#!/bin/sh
+if [ "$3" = reset ] && [ "$4" = -q ]; then
+  echo "injected git link index-reset failure" >&2
+  exit 1
+fi
+exec '${actualGit.stdout.trim()}' "$@"
+`); chmodSync(shim, 0o755);
+    const r = f.call(['fork', 'broken'], { PATH: `${bin}:${process.env.PATH}` });
+    assert.equal(r.status, 1);
+    const closed = f.read().projects.h14.closed.broken;
+    assert.match(closed.failed, /Git git reset -q:.*injected/);
+    assert.ok(!closed.cleanupFailed);
+    assert.equal(readFileSync(join(otherAdmin, 'HEAD'), 'utf8'), otherHead);
+    assert.equal(readFileSync(join(otherAdmin, 'gitdir'), 'utf8'), otherBacklink);
+    const registrations = f.g('worktree', 'list', '--porcelain');
+    assert.match(registrations, /refs\/heads\/lfs\/other/);
+    assert.doesNotMatch(registrations, /refs\/heads\/lfs\/broken/);
+    f.g('show-ref', '--verify', 'refs/heads/lfs/broken');
+    f.g('show-ref', '--verify', 'refs/heads/lfs/other');
+    assert.ok(f.sdk().mounts[other.path]);
+    assert.equal(Object.keys(f.sdk().mounts).length, 1);
+    f.ok(['reopen', 'broken']); f.ok(['drop', 'broken']); f.ok(['drop', 'other']);
   } finally { f.cleanup(); }
 });
 
@@ -105,6 +157,11 @@ test('non-Git caller uses cwd immediately; saved invalid routing falls back once
   const f = fixture();
   try {
     f.ok(['fork', 'normal']);
+    const id = Object.keys(f.read().workspaces)[0];
+    const duplicate = f.call(['fork', 'normal']);
+    assert.equal(duplicate.status, 1);
+    assert.ok((duplicate.stderr + duplicate.stdout).includes(`already open as workspace ${id}`));
+    assert.doesNotMatch(duplicate.stderr + duplicate.stdout, /use reopen/);
     assert.ok(f.herdr().calls.some(c => c.includes('--workspace') && c.includes('repo-caller')));
     f.ok(['drop', 'normal']);
     const s = f.read(); s.projects.h14.herdrWs = null; f.set(s);

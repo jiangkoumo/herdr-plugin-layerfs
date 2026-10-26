@@ -17,7 +17,8 @@ export class LayerFS {
     list_branches: async () => ({ items: Object.keys(load().branches).map(name => ({ name })), hasMore: false }),
     list_sandboxes: async () => { fault('sandbox'); return { items: [{ sandbox: '1', name: 'test', workspaces: 0 }] }; },
   };
-  sandbox = { list_workspaces: async () => ({ items: Object.values(load().mounts) }) };
+  // Match SDK filtering: attaching views are not included in this public list.
+  sandbox = { list_workspaces: async () => ({ items: Object.values(load().mounts).filter(w => w.mounted && w.directory) }) };
   branch = {
     fork: async (name, parent = 'main') => {
       const s = load();
@@ -33,7 +34,8 @@ export class LayerFS {
       fault('mount');
       const s = load(), path = join(process.env.LAYERFS_LOCAL_DIR, 'test', 'workspaces', String(++s.n));
       mkdirSync(path, { recursive: true }); cpSync(s.branches[branch], path, { recursive: true });
-      s.mounts[path] = { sandbox, branch, path }; save(s);
+      s.mounts[path] = { sandbox, branch, path, directory: path, mounted: process.env.H14_FAULT !== 'mount-pending' }; save(s);
+      fault('mount-pending');
       fault('mount-response');
       return { sandbox, path };
     },
