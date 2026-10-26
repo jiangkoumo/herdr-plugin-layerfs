@@ -91,12 +91,13 @@ const projName = (dir) => basename(dir).toLowerCase().replace(/[^a-z0-9_.-]/g, "
 const gitTop = (dir) => { const r = run("git", ["-C", dir, "rev-parse", "--show-toplevel"]); return r.status ? null : r.stdout.trim(); };
 const isMounted = (path) => existsSync(path) && run("mount", []).stdout.includes(` on ${path} `);
 
-async function sandboxFor(lf, project) {
+async function sandboxFor(lf, project, created = () => {}) {
   const p = st.projects[project];
   const live = (await lf.project.list_sandboxes(50, 0)).items ?? [];
   const hit = live.find((s) => s.sandbox === p.sandbox) || live.find((s) => s.workspaces < 16);
   if (hit) { p.sandbox = hit.sandbox; p.container = hit.name; save(); return hit.sandbox; }
   p.sandbox = (await lf.sandbox.create()).sandbox;
+  created(p.sandbox); // keep ownership even if the following lookup/save fails
   p.container = ((await lf.project.list_sandboxes(50, 0)).items ?? []).find((s) => s.sandbox === p.sandbox)?.name;
   save(); return p.sandbox;
 }
@@ -287,8 +288,9 @@ const existingAdvice = (project, branch) => {
 async function openClosed(lf, project, branch, p) {
   const meta = p.closed[branch];
   if (meta.cleanupFailed) throw new Error(`cleanup for ${branch} needs inspection at ${meta.path}: ${meta.cleanupFailed}; do not retry an uncertain unmount automatically`);
+  let createdSandbox;
   try {
-    const sb = await sandboxFor(lf, project);
+    const sb = await sandboxFor(lf, project, sandbox => { createdSandbox = sandbox; });
     let w;
     try { w = await lf.workspace.mount(sb, branch); }
     catch (err) {
@@ -309,6 +311,18 @@ async function openClosed(lf, project, branch, p) {
   } catch (err) {
     meta.failed = `${err.code ?? ""} ${err.message}`.trim().replace(/\s+/g, " ").slice(0, 500);
     if (err.cleanupFailed) meta.cleanupFailed = err.cleanupFailed;
+    // close() releases only this client's Store, not the daemon. Only retire a
+    // Sandbox this attempt created, after known mount cleanup. Never infer idle
+    // from the filtered public list. SDK close checks live views under its locks
+    // and refuses MountsActive if another caller acquired a Workspace meanwhile.
+    if (createdSandbox && !meta.cleanupFailed) {
+      try {
+        await lf.sandbox.close(createdSandbox);
+        if (p.sandbox === createdSandbox) { p.sandbox = null; p.container = null; }
+      } catch (cleanup) {
+        console.error(`Sandbox ${createdSandbox} retained after failed open: ${cleanup.code ?? ""} ${cleanup.message}; inspect it before explicit sandbox.close (otherwise its idle timeout applies).`);
+      }
+    }
     save();
     // Keep recovery commands outside the bounded SDK/CLI error summary.
     console.error(`LayerFS branch ${branch} kept: use reopen ${branch} to retry or drop ${branch} to forget its plugin record (Store history kept).${meta.cleanupFailed ? ` Inspect failed cleanup at ${meta.path ?? "the Sandbox"} first: ${meta.cleanupFailed}` : ""}`);

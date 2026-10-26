@@ -9,16 +9,36 @@ export class LayerFS {
   static async init(name, source) {
     const seed = join(process.env.LFS_STATE_DIR, 'seed');
     cpSync(source, seed, { recursive: true });
-    save({ branches: { main: seed }, mounts: {}, n: 0 });
+    save({ branches: { main: seed }, mounts: {}, n: 0, sandboxes: {}, sandboxN: 0, closeCalls: [] });
     return new LayerFS();
   }
   static async open() { return new LayerFS(); }
   project = {
     list_branches: async () => ({ items: Object.keys(load().branches).map(name => ({ name })), hasMore: false }),
-    list_sandboxes: async () => { fault('sandbox'); return { items: [{ sandbox: '1', name: 'test', workspaces: 0 }] }; },
+    list_sandboxes: async () => {
+      fault('sandbox');
+      if (process.env.H16_LIST_FAIL_AFTER_CREATE && Object.keys(load().sandboxes).length)
+        throw new Error('injected lookup after create');
+      return { items: Object.keys(load().sandboxes).map(sandbox => ({ sandbox, name: 'test', workspaces: Object.values(load().mounts).filter(w => w.sandbox === sandbox).length })) };
+    },
   };
   // Match SDK filtering: attaching views are not included in this public list.
-  sandbox = { list_workspaces: async () => ({ items: Object.values(load().mounts).filter(w => w.mounted && w.directory) }) };
+  sandbox = {
+    list_workspaces: async () => ({ items: Object.values(load().mounts).filter(w => w.mounted && w.directory) }),
+    create: async () => {
+      const s = load(), sandbox = String(++s.sandboxN);
+      s.sandboxes[sandbox] = true; save(s); return { sandbox };
+    },
+    close: async sandbox => {
+      const s = load(); s.closeCalls.push(sandbox); save(s);
+      if (process.env.H16_CLOSE_FAIL) throw Object.assign(new Error('injected close failure'), { code: 'Failed' });
+      // Model the binding's authoritative check, including a concurrent consumer
+      // invisible to plugin state and a pending view filtered out by the SDK list.
+      if (process.env.H16_CONCURRENT_MOUNT || Object.values(s.mounts).some(w => w.sandbox === sandbox))
+        throw Object.assign(new Error('another Workspace is active'), { code: 'MountsActive' });
+      delete s.sandboxes[sandbox]; save(s);
+    },
+  };
   branch = {
     fork: async (name, parent = 'main') => {
       const s = load();

@@ -48,6 +48,73 @@ test('fork failure is closed, unmounted and unlinked; reopen/drop keep Store his
   } finally { f.cleanup(); }
 });
 
+test('failed fork closes its newly created unused daemon; successful fork does not', () => {
+  const f = fixture();
+  try {
+    assert.equal(f.call(['fork', 'broken'], { H14_FAULT: 'herdr' }).status, 1);
+    assert.deepEqual(f.sdk().sandboxes, {});
+    assert.deepEqual(f.sdk().closeCalls, ['1']);
+    assert.equal(f.read().projects.h14.sandbox, null);
+    f.ok(['fork', 'normal']);
+    assert.equal(Object.keys(f.sdk().sandboxes).length, 1);
+    assert.deepEqual(f.sdk().closeCalls, ['1']);
+    f.ok(['drop', 'normal']);
+  } finally { f.cleanup(); }
+});
+
+test('failure after Sandbox create still closes the daemon before any mount', () => {
+  const f = fixture();
+  try {
+    const r = f.call(['fork', 'broken'], { H16_LIST_FAIL_AFTER_CREATE: '1' });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /injected lookup after create/);
+    assert.deepEqual(f.sdk().sandboxes, {});
+    assert.deepEqual(f.sdk().closeCalls, ['1']);
+    assert.equal(f.read().projects.h14.sandbox, null);
+    assert.deepEqual(f.sdk().mounts, {});
+    assert.ok(f.read().projects.h14.closed.broken.failed);
+  } finally { f.cleanup(); }
+});
+
+test('failed fork never closes a reused daemon, including an empty one', () => {
+  const f = fixture();
+  try {
+    f.ok(['fork', 'other']);
+    const other = Object.values(f.read().workspaces)[0];
+    assert.equal(f.call(['fork', 'broken'], { H14_FAULT: 'herdr' }).status, 1);
+    assert.ok(f.sdk().mounts[other.path]);
+    assert.deepEqual(f.sdk().closeCalls, []);
+    f.ok(['drop', 'other']);
+    assert.equal(f.call(['fork', 'broken-empty'], { H14_FAULT: 'herdr' }).status, 1);
+    assert.deepEqual(f.sdk().closeCalls, []);
+    assert.equal(Object.keys(f.sdk().sandboxes).length, 1);
+  } finally { f.cleanup(); }
+});
+
+test('new Sandbox acquired by another consumer is protected by SDK close refusal', () => {
+  const f = fixture();
+  try {
+    const r = f.call(['fork', 'broken'], { H14_FAULT: 'herdr', H16_CONCURRENT_MOUNT: '1' });
+    assert.equal(r.status, 1);
+    assert.equal(Object.keys(f.sdk().sandboxes).length, 1);
+    assert.deepEqual(f.sdk().closeCalls, ['1']);
+    assert.match(r.stderr, /MountsActive/);
+    assert.ok(!f.read().projects.h14.closed.broken.cleanupFailed);
+  } finally { f.cleanup(); }
+});
+
+test('failed Sandbox close reports the retained daemon without hiding fork failure', () => {
+  const f = fixture();
+  try {
+    const r = f.call(['fork', 'broken'], { H14_FAULT: 'herdr', H16_CLOSE_FAIL: '1' });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /injected herdr/);
+    assert.match(r.stderr, /injected close failure/);
+    assert.equal(Object.keys(f.sdk().sandboxes).length, 1);
+    assert.ok(f.read().projects.h14.closed.broken.failed);
+  } finally { f.cleanup(); }
+});
+
 test('sandbox and commit failures retain recoverable metadata', () => {
   for (const fault of ['sandbox', 'commit']) {
     const f = fixture();
@@ -69,6 +136,7 @@ test('unmount failure retains evidence and blocks unsafe reopen/drop', () => {
     assert.equal(r.status, 1);
     const e = f.read().projects.h14.closed.broken;
     assert.match(e.cleanupFailed, /unmount/); assert.ok(Object.keys(f.sdk().mounts).length);
+    assert.deepEqual(f.sdk().closeCalls, []);
     assert.equal(f.call(['reopen', 'broken']).status, 1);
     assert.equal(f.call(['drop', 'broken']).status, 1);
     assert.ok(f.read().projects.h14.closed.broken);
@@ -97,6 +165,7 @@ test('empty mount list cannot prove no effect, including a filtered pending view
       assert.equal(Object.values(before.mounts).filter(w => w.mounted && w.directory).length, 0);
       assert.equal(Object.keys(before.mounts).length, fault === 'mount-pending' ? 1 : 0);
       assert.match(f.read().projects.h14.closed.broken.cleanupFailed, /mount result unknown/);
+      assert.deepEqual(f.sdk().closeCalls, []);
       assert.equal(f.call(['reopen', 'broken']).status, 1);
       assert.equal(f.call(['drop', 'broken']).status, 1);
       assert.deepEqual(f.sdk(), before);
