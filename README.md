@@ -7,6 +7,12 @@ indented under the repo in the sidebar, exactly like `herdr worktree`, and `git 
 
 [中文说明](#中文说明)
 
+## Changes in 0.3.1
+
+- `drop [name] [--delete-git-branch]` forgets open or closed plugin records. Closed records need no remount.
+- Busy diagnostics list holders when `lsof` can identify them and suggest closing the Herdr workspace first.
+- LayerFS branches/history remain in the Store; this does not reclaim Store space (upstream has no deletion/GC).
+
 ## Changes in 0.3.0
 
 - `merge [with] [--name <new-branch>] [--open]` saves the current workspace and merges into a new branch.
@@ -112,6 +118,24 @@ The plugin has no diff command; SDK diffs still describe complete trees, includi
 Git commits. Saving the current Workspace and linking the new one may change LayerFS commits, but never advance
 Git refs or create Git merge commits on the input branches.
 
+### Dropping a workspace record
+
+Run `node lfs.mjs drop <name>` from the source repo or a registered workspace of the project. Without a name,
+`drop` uses the current workspace as before. Open workspaces are unmounted before cleanup; closed records are
+forgotten directly, without starting a Sandbox or mounting them. Only their own Git worktree registration and
+any known, unmounted residual native workspace directory are removed; Git branches are kept by default.
+Repeated named drop with no plugin record succeeds without changing the Store or an unrelated Git branch.
+
+Add `--delete-git-branch` to delete `lfs/<name>` only if it is an ancestor of the source repo's `HEAD` and
+`git branch -d` succeeds. A refusal retains the plugin record for another explicit cleanup attempt. It never
+uses `-D`. If the record is already gone, the flag does not delete an orphan Git branch.
+
+Busy keeps the record: diagnostics show PID/command when available. From another pane, run
+`herdr workspace close <id>` to release its shells, then `node lfs.mjs drop <name>` from the source repo.
+External holders must also release the mount; close may save changes before unmounting.
+**LayerFS branches and history remain in the Store, and Store space is not reclaimed (no upstream deletion/GC).**
+Git's merged status only qualifies the optional Git branch deletion; it says nothing about LayerFS changes.
+
 ### Default merge rules
 
 On import, if there is no root `.lww`, the plugin adds one **only to the imported copy**. It includes
@@ -153,7 +177,9 @@ node "$LFS"/lfs.mjs commit          # from inside a branch workspace: save it
 node "$LFS"/lfs.mjs merge           # merge with recorded parent into a new branch (no mount)
 node "$LFS"/lfs.mjs merge main --name release-check --open  # mount and open the result
 node "$LFS"/lfs.mjs reopen [name]   # mount a saved branch again (default: newest closed)
-node "$LFS"/lfs.mjs drop            # from inside a branch workspace: discard it (git branch kept)
+node "$LFS"/lfs.mjs drop            # discard current workspace (Git branch kept)
+node "$LFS"/lfs.mjs drop fix-login  # from source repo: forget open/closed plugin record without remounting
+node "$LFS"/lfs.mjs drop fix-login --delete-git-branch  # also git branch -d, only when merged
 node "$LFS"/lfs.mjs list            # projects and branches
 ```
 
@@ -182,6 +208,11 @@ node "$LFS"/lfs.mjs list            # projects and branches
 把 LayerFS 分支变成 Herdr 工作区：开一个新分支约 2 秒、几乎不占磁盘。native 模式下每个分支同时是源仓库的
 git worktree，所以会像 `herdr worktree` 一样缩进挂在仓库工作区下面（树状），里面照常 `git commit`、`git push`。
 关闭工作区自动保存并卸载；herdr 重启或电脑重启后，`startup` 钩子会重新挂载并恢复工作区。
+
+0.3.1 支持从源仓库执行 `drop 名字 [--delete-git-branch]`：closed 记录直接清理，不重挂载；默认保留 Git 分支。
+可选删除 Git 分支要求它已并入源仓库 HEAD 且 `git branch -d` 成功，失败保留插件记录；不存在的记录重复 drop 成功。
+Busy 提示会尽可能列出 lsof 的 PID/命令，可先 `herdr workspace close 工作区ID` 再 `drop 名字`。
+**LayerFS 历史保留在 store，空间不回收（上游暂无删除/GC）。**
 
 0.3.0 新增 merge 命令和导入副本的默认 `.lww`，并修复 drop 失败后记录丢失的问题。
 drop 先卸载、再清理 Git worktree 注册和 Herdr 工作区，全部成功后才删记录，保留 git 分支与 LayerFS 历史。
