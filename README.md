@@ -7,6 +7,14 @@ indented under the repo in the sidebar, exactly like `herdr worktree`, and `git 
 
 [中文说明](#中文说明)
 
+## Changes in 0.3.3
+
+- A failed fork/reopen stops a Sandbox created by that opening attempt after its mount cleanup succeeds, using
+  SDK `sandbox.close`. Reused Sandboxes stay running, even if empty. The SDK refuses close if another caller
+  has acquired a Workspace meanwhile. Unknown mount/unmount outcomes retain the daemon for inspection.
+- `LayerFS.close()` releases the client's Store only; Sandbox daemons otherwise use the SDK's 120-second idle
+  timeout. A refused/failed Sandbox close is reported with its ID without hiding the original opening failure.
+
 ## Changes in 0.3.2
 
 - A failed fork keeps a closed plugin record with its error and recovery commands. After a successful unmount,
@@ -132,6 +140,9 @@ If a fork fails after creating its LayerFS branch (Sandbox, mount, Git link or H
 as closed. `list` shows `closed <name> (fork failed: ...)`. The plugin attempts one unmount and removes only the
 matching Git worktree registration after unmount succeeds. The Git branch and Store history stay available.
 After successful cleanup, run `reopen <name>` to retry opening, or `drop <name>` to forget the plugin record.
+Version 0.3.3 also closes an unused Sandbox created by that attempt through SDK `sandbox.close`; reused
+Sandboxes stay running. A concurrent Workspace makes the SDK refuse close. Unknown mount/unmount outcomes
+keep the Sandbox for inspection, and a close refusal/failure reports its ID while preserving the original error.
 If cleanup failed, inspect its reported path and error first; automatic reopen/drop is blocked. Any mount
 exception is conservatively recorded as an unknown result and also blocks reopen/drop, even if the public
 workspace list is empty: that list filters out pending/unmounted views and may not cover every page. The
@@ -236,6 +247,11 @@ node "$LFS"/lfs.mjs list            # projects and branches
 把 LayerFS 分支变成 Herdr 工作区：开一个新分支约 2 秒、几乎不占磁盘。native 模式下每个分支同时是源仓库的
 git worktree，所以会像 `herdr worktree` 一样缩进挂在仓库工作区下面（树状），里面照常 `git commit`、`git push`。
 关闭工作区自动保存并卸载；herdr 重启或电脑重启后，`startup` 钩子会重新挂载并恢复工作区。
+
+0.3.3 在 fork/reopen 打开失败且挂载清理成功后，通过 SDK `sandbox.close` 关闭本次新建且无其他工作区的 Sandbox。
+复用的 Sandbox 即使空闲也不关闭；并发调用者挂上工作区时，SDK 会在锁内检查并拒绝关闭。
+挂载/卸载结果未知时保留 daemon 供检查；关闭失败报告 Sandbox ID 和原因，不覆盖原始错误。
+`LayerFS.close()` 只释放客户端 Store；未显式关闭的 Sandbox 按 SDK 的 120 秒空闲超时退出。
 
 0.3.2 在 fork 创建分支后失败时保存 closed 记录，`list` 显示失败摘要；卸载成功后仅清理该分支的 Git worktree 注册。
 可 `reopen 名字` 重试（也支持 Store 已有但插件无记录的分支，恢复 Git 链接），或 `drop 名字` 忘记记录。
